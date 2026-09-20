@@ -46,3 +46,10 @@ plugin loading order.
 
 This package is intentionally pinned to the HUST v1 ABI. It must be tested
 again before upgrading vLLM, because offloading interfaces are experimental.
+
+## Ownership and provenance
+
+This is the owner-maintained extraction of the tiered KV-cache residency and
+lifecycle work from vLLM-HUST. See [MAINTAINERS.md](MAINTAINERS.md) and
+[PROVENANCE.md](PROVENANCE.md) for ownership, attribution, and migration
+history.
