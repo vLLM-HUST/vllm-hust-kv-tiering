@@ -193,7 +193,9 @@ class FileSystemTierManager(SecondaryTierManager):
         self.file_mapper = FileMapper.from_offloading_spec(
             root_dir=root_dir,
             offloading_spec=offloading_spec,
-            gpu_blocks_per_file=offloading_spec.block_size_factor,
+            # vLLM-HUST v1 names the normalized chunk geometry
+            # ``blocks_per_chunk``.  It is the old block_size_factor value.
+            blocks_per_file=offloading_spec.blocks_per_chunk,
             parallel_agnostic=True,
         )
 
