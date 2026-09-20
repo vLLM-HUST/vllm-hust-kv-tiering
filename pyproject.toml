@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-hust-kv-tiering"
+version = "0.1.0"
+description = "KV cache tiering and lifecycle-management plugin for vLLM-HUST v1"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+license = {text = "Apache-2.0"}
+dependencies = ["vllm==0.28.1rc0"]
+
+[project.entry-points."vllm.general_plugins"]
+hust_kv_tiering = "vllm_hust_kv_tiering:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
