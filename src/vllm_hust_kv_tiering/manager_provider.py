@@ -30,8 +30,7 @@ class TieringProvider(VllmProvider):
                 "ascend_copy_backend": "torch_sync",
                 "secondary_tiers": [
                     {
-                        "type": "SegmentFileSystemTier",
-                        "module_path": "vllm_hust_kv_tiering.fs.manager",
+                        "type": "hust_fs",
                         "root_dir": storage,
                         "storage_layout": "segment",
                         "n_read_threads": 2,

@@ -36,3 +36,22 @@ def test_manager_plan_preserves_frontier_arguments():
         TieringProvider().plan(
             manifest, {**config, "cpu_bytes_to_use": True}, enabled=True
         )
+
+
+def test_storage_profile_resolves_on_actual_host_without_general_plugin(monkeypatch):
+    from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+    from vllm_hust_kv_tiering.spec import HustTieringOffloadingSpec
+    from vllm_hust_kv_tiering.fs.manager import SegmentFileSystemTier
+
+    registry = dict(SecondaryTierFactory._registry)
+    registry.pop("hust_fs", None)
+    monkeypatch.setattr(SecondaryTierFactory, "_registry", registry)
+    HustTieringOffloadingSpec._register_storage()
+    HustTieringOffloadingSpec._register_storage()
+    assert (
+        SecondaryTierFactory.get_tier_class({"type": "hust_fs"})
+        is SegmentFileSystemTier
+    )
+    registry["hust_fs"] = lambda: object
+    with pytest.raises(ValueError, match="another implementation"):
+        HustTieringOffloadingSpec._register_storage()

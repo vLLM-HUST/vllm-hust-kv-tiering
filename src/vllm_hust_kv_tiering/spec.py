@@ -2,8 +2,7 @@
 
 The v1 offloading factory loads this class from ``spec_module_path``.  The
 base spec owns the stable connector protocol; this plugin supplies its own
-secondary storage implementation through either ``type=hust_fs`` (after the
-general plugin is loaded) or the portable ``module_path`` configuration.
+secondary storage implementation through the host's ``hust_fs`` registry entry.
 """
 
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
@@ -11,6 +10,30 @@ from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
 class HustTieringOffloadingSpec(TieringOffloadingSpec):
     """Tiering spec pinned to the vLLM-HUST v1 offloading ABI."""
+
+    @staticmethod
+    def _register_storage():
+        from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+        from vllm_hust_kv_tiering.fs.manager import SegmentFileSystemTier
+
+        if "hust_fs" not in SecondaryTierFactory._registry:
+            SecondaryTierFactory.register_tier(
+                "hust_fs", "vllm_hust_kv_tiering.fs.manager", "SegmentFileSystemTier"
+            )
+        if (
+            SecondaryTierFactory.get_tier_class({"type": "hust_fs"})
+            is not SegmentFileSystemTier
+        ):
+            raise ValueError("hust_fs is already registered by another implementation")
+
+    def __init__(self, vllm_config, kv_cache_config):
+        self._register_storage()
+        super().__init__(vllm_config, kv_cache_config)
+
+    @classmethod
+    def build_metric_definitions(cls, extra_config):
+        cls._register_storage()
+        return super().build_metric_definitions(extra_config)
 
     def _ascend_copy_enabled(self):
         return self.extra_config.get("ascend_copy_backend") == "torch_sync"
