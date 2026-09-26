@@ -27,8 +27,8 @@ lookup() accumulates new keys in _lookup_batch without touching the queue.
 flush() is called once per step from the tier's on_schedule_end(), posting
 the entire batch as a single queue item so the background thread sees one
 batch per step.
-drain_results() is called before any lookup() calls in the same step, so
-lookup() is a pure OrderedDict operation.
+lookup() drains completed results before consulting its cached state. A worker
+may finish after an earlier retry, even when no new keys are queued.
 """
 
 import queue
@@ -95,7 +95,6 @@ class AsyncLookupManager(ABC):
         self._pending_results: queue.SimpleQueue[list[tuple[OffloadKey, bool]]] = (
             queue.SimpleQueue()
         )
-        self._need_to_drain: bool = False
 
         self._thread = threading.Thread(
             target=self._worker,
@@ -131,9 +130,7 @@ class AsyncLookupManager(ABC):
             False — block is not present in this tier.
             None  — result not yet available; retry next step.
         """
-        if self._need_to_drain:
-            self.drain_results()
-            self._need_to_drain = False
+        self.drain_results()
         req_id = req_context.req_id
         state = self._lookup_state.get(key)
         if state is None:
@@ -154,7 +151,6 @@ class AsyncLookupManager(ABC):
         """
         if not self._lookup_batch:
             return
-        self._need_to_drain = True
         self._lookup_queue.put(self._lookup_batch)
         self._lookup_batch = []
 

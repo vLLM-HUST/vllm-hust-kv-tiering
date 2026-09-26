@@ -1,0 +1,32 @@
+{
+  "schema_version": "0.2-experimental",
+  "extension_id": "org.vllm-hust.kv-tiering",
+  "extension_version": "0.1.1.dev0",
+  "kind": "kv_service_adapter",
+  "host": {
+    "provider": "hust-kv-tiering",
+    "name": "vllm",
+    "version_range": "==0.25.1+frontier.bidkv.empty"
+  },
+  "runtime": {
+    "type": "python",
+    "process_scope": "vllm-processes",
+    "isolation": "trusted_in_process"
+  },
+  "lifecycle_owner": "vllm",
+  "protocols": [],
+  "implementation": [
+    {
+      "type": "python_module",
+      "module": "vllm_hust_kv_tiering.spec",
+      "object": "HustTieringOffloadingSpec",
+      "status": "active"
+    }
+  ],
+  "requires_services": [],
+  "activation": {
+    "entry_points": [],
+    "environment": {},
+    "additional_config": {}
+  }
+}

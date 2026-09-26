@@ -190,12 +190,21 @@ class FileSystemTierManager(SecondaryTierManager):
         )
 
         # Opt in; FileMapper enables it only for a parallelism-invariant block.
+        ascend_profile = (
+            getattr(offloading_spec, "extra_config", {}).get("ascend_copy_backend")
+            == "torch_sync"
+        )
+        geometry = (
+            {"gpu_blocks_per_file": offloading_spec.block_size_factor}
+            if ascend_profile
+            else {"blocks_per_file": offloading_spec.blocks_per_chunk}
+        )
         self.file_mapper = FileMapper.from_offloading_spec(
             root_dir=root_dir,
             offloading_spec=offloading_spec,
             # vLLM-HUST v1 names the normalized chunk geometry
             # ``blocks_per_chunk``.  It is the old block_size_factor value.
-            blocks_per_file=offloading_spec.blocks_per_chunk,
+            **geometry,
             parallel_agnostic=True,
         )
 
@@ -211,7 +220,9 @@ class FileSystemTierManager(SecondaryTierManager):
         self.segment_store = (
             SegmentStore(
                 root_dir=os.path.join(
-                    self.file_mapper.get_rank_path(),
+                    f"{self.file_mapper.base_path}_r{self.file_mapper.rank}"
+                    if ascend_profile
+                    else self.file_mapper.get_rank_path(),
                     "segments",
                 ),
                 block_size=self._block_size,
