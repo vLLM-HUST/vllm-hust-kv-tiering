@@ -53,3 +53,42 @@ This is the owner-maintained extraction of the tiered KV-cache residency and
 lifecycle work from vLLM-HUST. See [MAINTAINERS.md](MAINTAINERS.md) and
 [PROVENANCE.md](PROVENANCE.md) for ownership, attribution, and migration
 history.
+
+## Experimental Ascend qualification branch
+
+This branch adds a default-off `ascend_copy_backend: torch_sync` adapter for the
+frozen Qwen3.5 Frontier capsule (`vllm` distribution
+`0.25.1+frontier.bidkv.empty`, core `d0f22d2bda562156e4dbf433ce645e1769b4f804`).
+It uses PyTorch NPU/CPU copies with explicit synchronization and the host's
+canonical KV-group/sub-block metadata. CUDA/XPU paths continue using the host
+worker. This is a correctness-first synchronous adapter, not a claimed fast
+DMA implementation. Its serving qualification and performance are pending.
+
+Provision the matched host separately and install this wheel with `--no-deps`;
+the package no longer asks pip to replace the accelerator runtime. Use the
+Extension Manager with an experiment-specific `VLLM_HUST_EXT_CONFIG`:
+
+```bash
+vllm-hust-ext extension validate org.vllm-hust.kv-tiering
+vllm-hust-ext extension configure org.vllm-hust.kv-tiering --file tiering.json
+vllm-hust-ext extension check org.vllm-hust.kv-tiering
+vllm-hust-ext extension enable org.vllm-hust.kv-tiering
+vllm-hust-ext run --dry-run -- vllm serve MODEL [unchanged Frontier arguments]
+vllm-hust-ext run -- vllm serve MODEL [unchanged Frontier arguments]
+```
+
+Configuration supplies `cpu_bytes_to_use` (positive integer) and
+`storage_directory` (absolute path). The provider renders the explicit
+`OffloadingConnector` spec and segment-file secondary tier; it does not change
+APC, MTP2, asynchronous scheduling, graph mode, context capacity or parallelism.
+An existing conflicting `--kv-transfer-config` is rejected. The installed host
+requires sufficient `/dev/shm` for the primary buffer. Use a fresh storage
+directory for qualification. Manager `enabled` means launch intent, not
+`runtime_effective` or a measured improvement.
+
+Validation so far includes a real 910B2 partial-page two-group NPU→CPU→NPU
+round trip and preservation of untouched padding. Full-model correctness,
+actual cache reuse, performance, and recovery must pass before production use
+or Frontier publication. Disable through `vllm-hust-ext extension disable`
+and restart the owned server to return to the Native arm; uninstalling is a
+separate package operation.
