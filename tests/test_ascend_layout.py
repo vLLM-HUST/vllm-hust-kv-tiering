@@ -17,7 +17,7 @@ from vllm_hust_kv_tiering.ascend_layout import build_layout
 from vllm_hust_kv_tiering.ascend_worker import AscendLayoutWorker
 
 
-def fixture(device="cpu"):
+def fixture(device="cpu", typed=False):
     raw = torch.arange(96, dtype=torch.int8).to(device)
     config = KVCacheConfig(
         4,
@@ -48,6 +48,27 @@ def fixture(device="cpu"):
         "attn": (raw[32:64].view(8, 4), raw[64:96].view(8, 4)),
         "mamba": [raw[:32].view(4, 8), raw[32:].view(4, 16)],
     }
+    if typed:
+        caches = {
+            "attn": tuple(t.view(torch.bfloat16) for t in caches["attn"]),
+            "mamba": [
+                caches["mamba"][0].view(torch.bfloat16),
+                caches["mamba"][1].view(torch.float32),
+            ],
+        }
+        config.kv_cache_groups[0].kv_cache_spec = FullAttentionSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.bfloat16,
+            page_size_padded=24,
+        )
+        config.kv_cache_groups[1].kv_cache_spec = MambaSpec(
+            block_size=4,
+            shapes=((4,), (4,)),
+            dtypes=(torch.bfloat16, torch.float32),
+            mamba_cache_mode="align",
+        )
     return raw, config, caches
 
 
@@ -68,9 +89,10 @@ def test_logical_rows_retain_runner_storage_and_share_cpu_allocation():
 @pytest.mark.skipif(
     not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires NPU"
 )
-def test_real_npu_soa_hybrid_store_restore_and_transaction_validation():
+@pytest.mark.parametrize("typed", [False, True])
+def test_real_npu_soa_hybrid_store_restore_and_transaction_validation(typed):
     torch.npu.set_device(0)
-    raw, config, caches = fixture("npu:0")
+    raw, config, caches = fixture("npu:0", typed)
     layout = build_layout(config, caches)
     region = SharedOffloadRegion(uuid.uuid4().hex, 4, 0, 4096, 48)
     worker = AscendLayoutWorker(layout, 2, 4, region)
