@@ -9,9 +9,14 @@ once device work has finished. It never replaces CUDA or XPU handlers globally.
 from __future__ import annotations
 
 import time
+import hashlib
+import os
 
 import torch
 from vllm.v1.kv_offload.base import OffloadingWorker, TransferResult
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def copy_plan(gpu_spec, cpu_spec, refs, factor):
@@ -83,6 +88,31 @@ class AscendCopyWorker(OffloadingWorker):
             destination, source = (cpu, device) if store else (device, cpu)
             destination.copy_(source, non_blocking=False)
         torch.npu.synchronize(self.device)
+        if os.environ.get("HUST_TIERING_DIAGNOSTICS") == "1":
+            # Diagnostic runs only. Hash one logical layer per group; no cache
+            # contents or request text are written to the log.
+            first_layers = {group[0].tensor_idx for group in self.refs if group}
+            seen = set()
+            for layer, block, cpu_block, sub_block, size in plan:
+                if layer not in first_layers or layer in seen:
+                    continue
+                seen.add(layer)
+                sampled = self._spans([(layer, block, cpu_block, sub_block, size)])
+                digests = [
+                    hashlib.sha256(memoryview(cpu.numpy())).hexdigest()
+                    for _, cpu in sampled
+                ]
+                nonzero = [int(cpu.count_nonzero()) for _, cpu in sampled]
+                logger.info(
+                    "TIERING_COPY store=%s job=%s layer=%s device_block=%s cpu_block=%s sha256=%s nonzero=%s",
+                    store,
+                    job_id,
+                    layer,
+                    block,
+                    cpu_block,
+                    digests,
+                    nonzero,
+                )
         self.completed.append(
             TransferResult(
                 job_id=job_id,
