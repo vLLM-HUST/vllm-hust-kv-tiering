@@ -20,7 +20,8 @@ class TieringProvider(VllmProvider):
         if not isinstance(storage, str) or not Path(storage).is_absolute():
             raise ValueError("storage_directory must be an absolute path")
         connector = {
-            "kv_connector": "OffloadingConnector",
+            "kv_connector": "HustAscendTieringConnector",
+            "kv_connector_module_path": "vllm_hust_kv_tiering.ascend_connector",
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
                 "spec_name": "HustTieringOffloadingSpec",

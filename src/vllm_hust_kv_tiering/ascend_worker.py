@@ -76,22 +76,7 @@ class AscendCopyWorker(OffloadingWorker):
         if job_id in self.pending:
             raise ValueError("transfer job ID is already pending")
         plan = copy_plan(gpu_spec, cpu_spec, self.refs, self.factor)
-        # Validate the entire transaction before touching any destination.
-        spans = []
-        for tensor_idx, device_block, cpu_block, sub_block, size in plan:
-            device = self.device_tensors[tensor_idx]
-            cpu = self.cpu_tensors[tensor_idx]
-            page_size = device.shape[1]
-            if not (
-                0 <= device_block < device.shape[0] and 0 <= cpu_block < cpu.shape[0]
-            ):
-                raise ValueError("transfer block outside allocated cache")
-            if not 0 < size <= page_size:
-                raise ValueError("invalid canonical page size")
-            offset = sub_block * page_size
-            spans.append(
-                (device[device_block, :size], cpu[cpu_block, offset : offset + size])
-            )
+        spans = self._spans(plan)
         start = time.monotonic()
         torch.npu.synchronize(self.device)
         for device, cpu in spans:
@@ -108,6 +93,25 @@ class AscendCopyWorker(OffloadingWorker):
         )
         self.pending.add(job_id)
         return True
+
+    def _spans(self, plan):
+        # Validate the entire transaction before touching any destination.
+        spans = []
+        for tensor_idx, device_block, cpu_block, sub_block, size in plan:
+            device = self.device_tensors[tensor_idx]
+            cpu = self.cpu_tensors[tensor_idx]
+            page_size = device.shape[1]
+            if not (
+                0 <= device_block < device.shape[0] and 0 <= cpu_block < cpu.shape[0]
+            ):
+                raise ValueError("transfer block outside allocated cache")
+            if not 0 < size <= page_size:
+                raise ValueError("invalid canonical page size")
+            offset = sub_block * page_size
+            spans.append(
+                (device[device_block, :size], cpu[cpu_block, offset : offset + size])
+            )
+        return spans
 
     def submit_store(self, job_id, src_spec, dst_spec):
         return self._copy(job_id, src_spec, dst_spec, True)
@@ -130,3 +134,47 @@ class AscendCopyWorker(OffloadingWorker):
         self.completed.clear()
         self.pending.clear()
         self.region.cleanup()
+
+
+class AscendLayoutWorker(AscendCopyWorker):
+    def __init__(self, layout, block_size_factor, num_cpu_blocks, mmap_region):
+        self.region = mmap_region
+        self.factor = block_size_factor
+        self.refs = layout.group_data_refs
+        self.layers = layout.layers
+        self.pages = layout.page_sizes
+        self.device_tensors = [row for _, rows in self.layers for row in rows]
+        if not self.device_tensors or any(
+            row.device.type != "npu" for row in self.device_tensors
+        ):
+            raise ValueError("AscendLayoutWorker requires NPU cache views")
+        self.device = self.device_tensors[0].device
+        if any(row.device != self.device for row in self.device_tensors):
+            raise ValueError("cache views span multiple devices")
+        self.cpu_tensors = [
+            mmap_region.create_next_view(page * self.factor) for page in self.pages
+        ]
+        self.completed = []
+        self.pending = set()
+
+    def _spans(self, plan):
+        spans = []
+        for layer, device_block, cpu_block, sub_block, size in plan:
+            allocation, rows = self.layers[layer]
+            cpu = self.cpu_tensors[allocation]
+            if not 0 <= cpu_block < cpu.shape[0]:
+                raise ValueError("CPU block outside allocated cache")
+            if size != sum(row.shape[1] for row in rows):
+                raise ValueError("logical cache page size changed")
+            offset = sub_block * self.pages[allocation]
+            for row in rows:
+                if not 0 <= device_block < row.shape[0]:
+                    raise ValueError("device block outside allocated cache")
+                end = offset + row.shape[1]
+                spans.append((row[device_block], cpu[cpu_block, offset:end]))
+                offset = end
+        return spans
+
+    def shutdown(self):
+        self.layers.clear()
+        super().shutdown()

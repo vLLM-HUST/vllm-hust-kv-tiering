@@ -22,6 +22,8 @@ class HustTieringOffloadingSpec(TieringOffloadingSpec):
         from vllm.distributed import get_world_group
         from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
         from vllm_hust_kv_tiering.ascend_worker import AscendCopyWorker
+        from vllm_hust_kv_tiering.ascend_worker import AscendLayoutWorker
+        from vllm_hust_kv_tiering.ascend_layout import AscendLayout
 
         if not hasattr(torch, "npu"):
             raise ValueError("torch_sync requires the Ascend runtime")
@@ -34,7 +36,12 @@ class HustTieringOffloadingSpec(TieringOffloadingSpec):
                 cpu_page_size=self.cpu_page_size_per_worker,
             )
             try:
-                self._worker = AscendCopyWorker(
+                worker_type = (
+                    AscendLayoutWorker
+                    if isinstance(kv_caches, AscendLayout)
+                    else AscendCopyWorker
+                )
+                self._worker = worker_type(
                     kv_caches,
                     self.block_size_factor,
                     self.num_blocks,

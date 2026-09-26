@@ -92,3 +92,11 @@ actual cache reuse, performance, and recovery must pass before production use
 or Frontier publication. Disable through `vllm-hust-ext extension disable`
 and restart the owned server to return to the Native arm; uninstalling is a
 separate package operation.
+
+The experimental Ascend profile uses a plugin-owned connector to pack logical
+blocks from the runner's separate K/V and Mamba state views. CPU slots remain
+shared according to the host allocation map; padding is not read as live state.
+Packed allocations and layouts that require copying to form a view are rejected.
+This addresses the Tensor-only registration failure found in the first full-model
+Frontier attempt. Full-model qualification is still required before publishing
+performance or treating this adapter as a supported release.
