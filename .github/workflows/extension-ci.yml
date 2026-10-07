@@ -1,0 +1,67 @@
+name: Extension CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  package:
+    strategy:
+      matrix:
+        python: ["3.10", "3.12", "3.14"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: >-
+          python -m pip install
+          "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@0061862102324a8ad2db59e154bc0f811bf4d4e2"
+          build pytest ruff
+      - run: python -m pip install --no-deps -e .
+      - run: >-
+          python -m ruff check
+          src/vllm_hust_kv_tiering/__init__.py
+          src/vllm_hust_kv_tiering/manager_provider.py
+          tests/test_manager_provider.py
+      - run: >-
+          python -m ruff format --check
+          src/vllm_hust_kv_tiering/__init__.py
+          src/vllm_hust_kv_tiering/manager_provider.py
+          tests/test_manager_provider.py
+      - run: python -m pytest -q tests/test_manager_provider.py
+      - run: python -m build
+      - name: Verify clean-wheel ECPA lifecycle
+        if: matrix.python == '3.12'
+        run: |
+          python -m venv .ecpa-smoke
+          .ecpa-smoke/bin/python -m pip install \
+            "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@0061862102324a8ad2db59e154bc0f811bf4d4e2"
+          .ecpa-smoke/bin/python -m pip install \
+            --no-deps dist/vllm_hust_kv_tiering-*.whl
+          export XDG_CONFIG_HOME="$PWD/.ecpa-state/config"
+          export XDG_STATE_HOME="$PWD/.ecpa-state/state"
+          export XDG_CACHE_HOME="$PWD/.ecpa-state/cache"
+          cli=.ecpa-smoke/bin/vllm-hust-ext
+          "$cli" extension list \
+            | grep 'org.vllm-hust.kv-tiering 0.1.1.dev0 disabled'
+          "$cli" extension inspect org.vllm-hust.kv-tiering \
+            | grep 'vllm.kv-transfer-config'
+          "$cli" extension validate org.vllm-hust.kv-tiering >/dev/null
+          "$cli" extension configure org.vllm-hust.kv-tiering \
+            --file examples/ecpa-tiering.json
+          "$cli" extension check org.vllm-hust.kv-tiering \
+            | grep 'host version is unavailable'
+          "$cli" extension enable org.vllm-hust.kv-tiering
+          "$cli" extension plan org.vllm-hust.kv-tiering \
+            | grep 'render_connector_config'
+          "$cli" extension render org.vllm-hust.kv-tiering \
+            | grep 'HustAscendTieringConnector'
+          if "$cli" run --dry-run -- vllm serve MODEL; then
+            echo 'unknown host version was unexpectedly accepted' >&2
+            exit 1
+          fi
+          "$cli" extension disable org.vllm-hust.kv-tiering
+          "$cli" extension forget org.vllm-hust.kv-tiering
