@@ -1,8 +1,9 @@
 from pathlib import Path
 
 import pytest
-from vllm_hust_ext.manifest import activation_blocker, load_manifest
 from vllm_hust_ext.cli import _merge_provider_plan
+from vllm_hust_ext.manifest import activation_blocker, load_manifest
+
 from vllm_hust_kv_tiering.manager_provider import TieringProvider
 
 
@@ -11,7 +12,7 @@ def test_manager_plan_preserves_frontier_arguments():
 
     manifest = load_manifest(
         Path(vllm_hust_kv_tiering.__file__).parent
-        / "manifests/vllm-hust-extension-v0.2.json"
+        / "manifests/vllm-hust-extension-v0.3.json"
     )
     assert activation_blocker(manifest) is None
     config = {"cpu_bytes_to_use": 8388608, "storage_directory": "/tmp/tiering-test"}
@@ -36,12 +37,18 @@ def test_manager_plan_preserves_frontier_arguments():
         TieringProvider().plan(
             manifest, {**config, "cpu_bytes_to_use": True}, enabled=True
         )
+    unconfigured = TieringProvider().check(manifest, {})
+    assert unconfigured.configured is False
+    assert unconfigured.degraded is True
+    assert "positive integer" in unconfigured.evidence[-1]
 
 
 def test_storage_profile_resolves_on_actual_host_without_general_plugin(monkeypatch):
+    pytest.importorskip("vllm")
     from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
-    from vllm_hust_kv_tiering.spec import HustTieringOffloadingSpec
+
     from vllm_hust_kv_tiering.fs.manager import SegmentFileSystemTier
+    from vllm_hust_kv_tiering.spec import HustTieringOffloadingSpec
 
     registry = dict(SecondaryTierFactory._registry)
     registry.pop("hust_fs", None)

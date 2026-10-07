@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from vllm_hust_ext.providers.base import PlanAction, ProviderPlan, RenderArtifact
@@ -12,13 +13,31 @@ from vllm_hust_ext.providers.vllm import VllmProvider
 class TieringProvider(VllmProvider):
     name = "hust-kv-tiering"
 
-    def plan(self, manifest, configuration, *, enabled):
+    @staticmethod
+    def _settings(configuration):
         size = configuration.get("cpu_bytes_to_use")
         if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
             raise ValueError("cpu_bytes_to_use must be a positive integer")
         storage = configuration.get("storage_directory")
         if not isinstance(storage, str) or not Path(storage).is_absolute():
             raise ValueError("storage_directory must be an absolute path")
+        return size, storage
+
+    def check(self, manifest, configuration):
+        check = super().check(manifest, configuration)
+        try:
+            self._settings(configuration)
+        except ValueError as error:
+            return replace(
+                check,
+                configured=False,
+                degraded=True,
+                evidence=check.evidence + (str(error),),
+            )
+        return check
+
+    def plan(self, manifest, configuration, *, enabled):
+        size, storage = self._settings(configuration)
         connector = {
             "kv_connector": "HustAscendTieringConnector",
             "kv_connector_module_path": "vllm_hust_kv_tiering.ascend_connector",

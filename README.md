@@ -46,6 +46,10 @@ plugin loading order.
 
 This package is intentionally pinned to the HUST v1 ABI. It must be tested
 again before upgrading vLLM, because offloading interfaces are experimental.
+Its ECPA 0.3 manifest exclusively claims the process-local KV transfer
+configuration and `hust_fs` secondary-tier registration. Installing the wheel
+only makes the extension discoverable; enablement remains explicit, and
+`runtime_effective` requires process-owned observer evidence.
 
 ## Ownership and provenance
 
@@ -92,6 +96,9 @@ actual cache reuse, performance, and recovery must pass before production use
 or Frontier publication. Disable through `vllm-hust-ext extension disable`
 and restart the owned server to return to the Native arm; uninstalling is a
 separate package operation.
+
+[`examples/ecpa-tiering.json`](examples/ecpa-tiering.json) is a minimal
+non-production configuration for contract and clean-wheel validation.
 
 The experimental Ascend profile uses a plugin-owned connector to pack logical
 blocks from the runner's separate K/V and Mamba state views. CPU slots remain
