@@ -1,0 +1,55 @@
+{
+  "schema_version": "0.3-experimental",
+  "extension_id": "org.vllm-hust.kv-tiering",
+  "extension_version": "0.1.1.dev0",
+  "kind": "kv_service_adapter",
+  "host": {
+    "provider": "hust-kv-tiering",
+    "name": "vllm",
+    "version_range": "==0.25.1+frontier.bidkv.empty"
+  },
+  "runtime": {
+    "type": "python",
+    "process_scope": "vllm-processes",
+    "isolation": "trusted_in_process"
+  },
+  "lifecycle_owner": "vllm",
+  "protocols": [
+    {
+      "name": "vllm.kv-offload-tiering",
+      "version_range": null
+    }
+  ],
+  "implementation": [
+    {
+      "type": "python_entry_point",
+      "group": "vllm.general_plugins",
+      "name": "hust_kv_tiering",
+      "value": "vllm_hust_kv_tiering:register"
+    }
+  ],
+  "requires_services": [],
+  "requires_extensions": [],
+  "resource_claims": [
+    {
+      "resource": "vllm.kv-transfer-config",
+      "scope": "vllm-process",
+      "mode": "exclusive"
+    },
+    {
+      "resource": "vllm.kv-offload.secondary-tier.hust-fs",
+      "scope": "vllm-process",
+      "mode": "exclusive"
+    }
+  ],
+  "activation": {
+    "entry_points": [
+      {
+        "group": "vllm.general_plugins",
+        "name": "hust_kv_tiering"
+      }
+    ],
+    "environment": {},
+    "additional_config": {}
+  }
+}

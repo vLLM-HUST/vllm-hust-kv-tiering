@@ -1,0 +1,4 @@
+{
+  "cpu_bytes_to_use": 8388608,
+  "storage_directory": "/tmp/ecpa-kv-tiering"
+}
