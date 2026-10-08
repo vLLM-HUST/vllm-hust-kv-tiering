@@ -107,3 +107,11 @@ Packed allocations and layouts that require copying to form a view are rejected.
 This addresses the Tensor-only registration failure found in the first full-model
 Frontier attempt. Full-model qualification is still required before publishing
 performance or treating this adapter as a supported release.
+
+## Canonical MOD metadata
+
+Repository identity, directly responsible maintainers, advisor status, default-off
+activation, rollback, scope, and evidence qualification are recorded in
+[`MOD_METADATA.json`](MOD_METADATA.json). `advisor_status: unknown` is not the
+same as confirmed `none`. Performance statements remain limited to the workloads
+and evidence labels recorded there; they are not general online claims.
