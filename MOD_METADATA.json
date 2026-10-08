@@ -1,0 +1,41 @@
+{
+  "canonical_repository": "https://github.com/vLLM-HUST/vllm-hust-kv-tiering",
+  "display_name": "KV Tiering",
+  "evidence": {
+    "index": "https://github.com/vLLM-HUST/vllm-hust-website/blob/main/docs/FRONTIER-KV-TIERING-20260926.md",
+    "latest_result": "https://github.com/vLLM-HUST/vllm-hust-website/blob/main/docs/FRONTIER-KV-TIERING-20260926.md",
+    "performance_claims": [],
+    "qualification": "unqualified"
+  },
+  "lifecycle": {
+    "activation_contract": "See the extension manifest and README; discovery alone does not enable this MOD.",
+    "default_enabled": false,
+    "rollback_contract": "Disable the MOD and return to the unmodified host path.",
+    "status": "experimental"
+  },
+  "metadata_source": {
+    "commit": "7df1647048ac5f05fcc502ce4bea94f26d0f5362",
+    "repository": "vLLM-HUST/vllm-hust-website"
+  },
+  "mod_id": "kv-tiering-migration",
+  "repository": "vllm-hust-kv-tiering",
+  "responsibility": {
+    "advisor_status": "unknown",
+    "advisors": [],
+    "maintainers": [
+      {
+        "github": "JieYang2001",
+        "name": "JieYang2001"
+      }
+    ],
+    "organization": "vLLM-HUST"
+  },
+  "schema_version": "vllm-hust-mod-metadata-v1",
+  "scope": {
+    "mechanism": "kv_residency_provider",
+    "out_of_scope": [],
+    "supported_workloads": [
+      "Qwen3.5-35B-A3B BF16 — Frontier configuration only"
+    ]
+  }
+}
