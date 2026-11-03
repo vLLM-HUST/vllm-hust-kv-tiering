@@ -4,13 +4,14 @@ import pytest
 import torch
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
-    CanonicalKVCacheTensor,
     CanonicalKVCaches,
+    CanonicalKVCacheTensor,
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm_hust_kv_tiering.ascend_worker import AscendCopyWorker, copy_plan
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+from vllm_hust_kv_tiering.ascend_worker import AscendCopyWorker, copy_plan
 
 
 def test_group_alignment_and_padding():
@@ -53,6 +54,7 @@ def test_real_npu_hybrid_partial_page_round_trip(tmp_path):
     cpu = CPULoadStoreSpec([0, 1, 2])
     try:
         assert worker.submit_store(1, gpu, cpu)
+        worker.wait({1})
         assert worker.get_finished()[0].transfer_size == 29
         tensors[0][1:3].zero_()
         tensors[1][3].zero_()

@@ -13,6 +13,7 @@ from collections import deque
 from collections.abc import Callable, Iterable
 
 from vllm.logger import init_logger
+
 from vllm_hust_kv_tiering.base import JobId
 
 logger = init_logger(__name__)
@@ -26,12 +27,12 @@ class JobState:
     """
 
     __slots__ = (
-        "_job_id",
-        "_n_tasks",
         "_completed",
-        "_success",
+        "_job_id",
         "_lock",
+        "_n_tasks",
         "_on_complete",
+        "_success",
     )
 
     def __init__(
@@ -187,7 +188,7 @@ class DualQueueThreadPool:
             try:
                 task()
                 job_finished, success = state.task_done(True)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - block I/O error is best-effort
                 logger.error(
                     "Job %s block I/O failed: %s",
                     state.job_id,

@@ -106,10 +106,12 @@ def test_real_npu_soa_hybrid_store_restore_and_transaction_validation(typed):
             gpu = GPULoadStoreSpec([1, 2], sizes, logical)
             cpu = CPULoadStoreSpec([0, 1])
             worker.submit_store(group * 2, gpu, cpu)
+            worker.wait({group * 2})
             assert worker.get_finished()[0].transfer_size == (32 if group == 0 else 48)
             for row in layout.layers[group][1]:
                 row[1:3].zero_()
             worker.submit_load(group * 2 + 1, cpu, gpu)
+            worker.wait({group * 2 + 1})
             worker.get_finished()
             assert torch.equal(raw.cpu(), expected)
         before = raw.cpu()

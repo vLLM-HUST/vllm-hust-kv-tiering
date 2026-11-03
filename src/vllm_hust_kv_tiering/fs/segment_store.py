@@ -58,9 +58,7 @@ class SegmentStore:
             raise ValueError("segment_shards must be greater than zero")
 
         self.block_size = block_size
-        self.segment_size_bytes = (
-            segment_size_bytes // block_size
-        ) * block_size
+        self.segment_size_bytes = (segment_size_bytes // block_size) * block_size
         self.segment_shards = segment_shards
         self.root_dir = Path(root_dir)
         self.root_dir.mkdir(parents=True, exist_ok=True)
@@ -182,9 +180,7 @@ class SegmentStore:
             for start in range(0, len(values), _INDEX_BATCH_SIZE)
         ]
 
-    def get_locations(
-        self, keys: Sequence[OffloadKey]
-    ) -> list[SegmentLocation | None]:
+    def get_locations(self, keys: Sequence[OffloadKey]) -> list[SegmentLocation | None]:
         if not keys:
             return []
         key_bytes = [bytes(key) for key in keys]
@@ -260,9 +256,7 @@ class SegmentStore:
             expected = sum(len(view) for view in chunk)
             bytes_read = os.preadv(fd, chunk, offset)
             if bytes_read != expected:
-                raise OSError(
-                    f"Short read: expected {expected}, read {bytes_read}"
-                )
+                raise OSError(f"Short read: expected {expected}, read {bytes_read}")
             offset += bytes_read
 
     def store_many(
@@ -387,8 +381,7 @@ class SegmentStore:
         for entry in entries:
             expected_offset = current_offset + len(views) * self.block_size
             if views and (
-                entry.segment_id != current_segment
-                or entry.offset != expected_offset
+                entry.segment_id != current_segment or entry.offset != expected_offset
             ):
                 flush()
             if not views:
@@ -446,8 +439,7 @@ class SegmentStore:
             (
                 location,
                 byte_view[
-                    int(block_id)
-                    * self.block_size : (int(block_id) + 1)
+                    int(block_id) * self.block_size : (int(block_id) + 1)
                     * self.block_size
                 ],
             )
@@ -488,12 +480,9 @@ class SegmentStore:
                         f"expected size {self.block_size}"
                     )
                 expected_offset = current_offset + current_length
-                if (
-                    current_views
-                    and (
-                        location.segment_id != current_segment
-                        or location.offset != expected_offset
-                    )
+                if current_views and (
+                    location.segment_id != current_segment
+                    or location.offset != expected_offset
                 ):
                     flush()
                 if not current_views:

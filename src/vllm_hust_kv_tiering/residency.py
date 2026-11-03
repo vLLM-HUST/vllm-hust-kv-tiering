@@ -38,9 +38,7 @@ class TieringMetrics:
     STORE_DECISIONS = "vllm:kv_tiering_store_decisions"
     MIGRATION_BUDGET = "vllm:kv_tiering_migration_budget_blocks"
     REUSE_SIGNALS = "vllm:kv_tiering_reuse_signals"
-    TRANSFER_SUBMIT_TO_COMPLETE = (
-        "vllm:kv_tiering_transfer_submit_to_complete_seconds"
-    )
+    TRANSFER_SUBMIT_TO_COMPLETE = "vllm:kv_tiering_transfer_submit_to_complete_seconds"
     TRANSFER_OPS = "vllm:kv_tiering_transfer_ops"
     WAIT_SECONDS = "vllm:kv_tiering_worker_wait_seconds"
     H2D_ADMISSION = "vllm:kv_tiering_h2d_submit_to_admitted_seconds"

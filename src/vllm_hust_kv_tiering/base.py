@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-
 from vllm.v1.kv_offload.base import (
     LookupResult,
     OffloadingMetricMetadata,
@@ -110,7 +109,6 @@ class SecondaryTierManager(ABC):
             MISS if not found,
             or RETRY if the block is being transferred (retry later).
         """
-        pass
 
     @abstractmethod
     def submit_store(self, job_metadata: JobMetadata) -> None:
@@ -138,7 +136,6 @@ class SecondaryTierManager(ABC):
             job_metadata: Job metadata including job_id, keys, and block_ids
                           identifying the primary-tier slots to read from.
         """
-        pass
 
     @abstractmethod
     def submit_load(self, job_metadata: JobMetadata) -> None:
@@ -163,7 +160,6 @@ class SecondaryTierManager(ABC):
             job_metadata: Job metadata including job_id, keys, and block_ids
                           identifying the primary-tier slots to write into.
         """
-        pass
 
     @abstractmethod
     def get_finished_jobs(self) -> Iterable[JobResult]:
@@ -177,7 +173,6 @@ class SecondaryTierManager(ABC):
             Iterable of JobResult objects for jobs finished since the
             last call.
         """
-        pass
 
     def has_pending_work(self) -> bool:
         """Whether this tier needs the engine to keep stepping.
@@ -208,7 +203,6 @@ class SecondaryTierManager(ABC):
         Args:
             req_context: Per-request context.
         """
-        pass
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         """
@@ -257,7 +251,6 @@ class SecondaryTierManager(ABC):
         store. Queued (not-yet-started) transfers may be cancelled, but their
         failure result must still appear in `get_finished_jobs()`.
         """
-        pass
 
     def shutdown(self) -> None:
         """Release resources held by this tier (threads, connections, etc.)."""

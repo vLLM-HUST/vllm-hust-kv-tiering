@@ -211,7 +211,7 @@ class AsyncLookupManager(ABC):
             for req_context, keys in batches.values():
                 try:
                     hits = self.batch_lookup(keys, req_context)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - tier I/O error is best-effort
                     logger.warning(
                         "batch_lookup failed on tier %s for %d keys: %s",
                         self._tier_type,

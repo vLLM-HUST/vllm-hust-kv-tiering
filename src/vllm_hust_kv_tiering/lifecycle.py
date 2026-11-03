@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
+
 from vllm_hust_kv_tiering.residency import BlockResidencyTracker
 
 
@@ -292,10 +293,7 @@ class SessionLifecycleManager:
             return ExpirationResult()
 
         now = time.monotonic()
-        if (
-            self._next_expiration_at is None
-            or self._next_expiration_at > now
-        ):
+        if self._next_expiration_at is None or self._next_expiration_at > now:
             return ExpirationResult()
         protected_key_set = set(protected_keys)
         protected_req_set = set(protected_req_ids)
