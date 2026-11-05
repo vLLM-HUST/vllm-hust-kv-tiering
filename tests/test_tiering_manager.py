@@ -18,7 +18,6 @@ from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
-
 from vllm_hust_kv_tiering.base import TierDeleteResult
 from vllm_hust_kv_tiering.lifecycle import LifecycleConfig, SessionLifecycleManager
 from vllm_hust_kv_tiering.lifecycle_manager import LifecycleAwareManager
@@ -342,3 +341,43 @@ def test_secondary_failure_does_not_release_unrelated_load_pin(make_manager):
     assert manager._cpu.remove([b"a"]) == set()
     manager.complete_load([b"a"], context)
     assert manager._cpu.status(b"a").ref_cnt == 0
+
+
+def test_lifecycle_prometheus_gauges_and_expiry_deltas(make_manager):
+    from vllm_hust_kv_tiering.residency import TieringMetrics
+
+    config = LifecycleConfig(residency_tracking_enabled=True, idle_ttl_sec=1)
+    manager, _, clock = make_manager(lifecycle=config)
+    context = request(manager)
+    first = manager.get_stats().reduce()
+    assert first[TieringMetrics.SESSION_STATES + ":('active',)"] == 1
+    assert first[TieringMetrics.SESSION_STATES + ":('idle',)"] == 0
+    store(manager, context, [b"a"])
+    manager.on_request_finished(context)
+    step(manager, clock)
+    idle = manager.get_stats().reduce()
+    assert idle[TieringMetrics.SESSION_STATES + ":('idle',)"] == 1
+    clock.now += 2
+    step(manager, clock)
+    expired = manager.get_stats().reduce()
+    assert expired[TieringMetrics.SESSION_STATES + ":('idle',)"] == 0
+    assert expired[TieringMetrics.EXPIRED_SESSIONS] == 1
+    assert TieringMetrics.EXPIRED_SESSIONS not in manager.get_stats().reduce()
+
+
+def test_cpu_reclaim_metric_reports_completion_once(make_manager):
+    from vllm_hust_kv_tiering.residency import TieringMetrics
+
+    config = LifecycleConfig(residency_tracking_enabled=True, cpu_demote_after_sec=1)
+    manager, tier, clock = make_manager(lifecycle=config)
+    context = request(manager)
+    store(manager, context, [b"a"])
+    manager.on_request_finished(context)
+    step(manager, clock)
+    clock.now += 2
+    step(manager, clock)
+    tier.finish()
+    step(manager, clock)
+    name = TieringMetrics.PRIMARY_RECLAIMED_BLOCKS + ":('policy',)"
+    assert manager.get_stats().reduce()[name] == 1
+    assert name not in manager.get_stats().reduce()

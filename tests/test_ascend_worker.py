@@ -15,7 +15,6 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
-
 from vllm_hust_kv_tiering.ascend_worker import AscendCopyWorker, copy_plan
 
 
@@ -39,8 +38,11 @@ def test_group_alignment_and_padding():
     or not torch.npu.is_available(),
     reason="requires VLLM_KV_TIERING_RUN_NPU_TESTS=1 and an available real Ascend NPU",
 )
-def test_real_npu_hybrid_partial_page_round_trip(tmp_path):
-    torch.npu.set_device(0)
+@pytest.mark.parametrize("device_index", [0, 1])
+def test_real_npu_hybrid_partial_page_round_trip(tmp_path, device_index):
+    if device_index >= torch.npu.device_count():
+        pytest.skip("requested NPU is not visible")
+    torch.npu.set_device(device_index)
     tensors = [
         torch.arange(64, dtype=torch.int8).view(4, 16).npu(),
         (torch.arange(64, dtype=torch.int8) + 40).view(4, 16).npu(),

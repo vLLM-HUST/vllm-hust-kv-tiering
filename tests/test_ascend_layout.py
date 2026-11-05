@@ -17,7 +17,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_offload.base import GPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
-
 from vllm_hust_kv_tiering.ascend_layout import build_layout
 from vllm_hust_kv_tiering.ascend_worker import AscendLayoutWorker
 
@@ -99,9 +98,14 @@ def test_logical_rows_retain_runner_storage_and_share_cpu_allocation():
     reason="requires VLLM_KV_TIERING_RUN_NPU_TESTS=1 and an available real Ascend NPU",
 )
 @pytest.mark.parametrize("typed", [False, True])
-def test_real_npu_soa_hybrid_store_restore_and_transaction_validation(typed):
-    torch.npu.set_device(0)
-    raw, config, caches = fixture("npu:0", typed)
+@pytest.mark.parametrize("device_index", [0, 1])
+def test_real_npu_soa_hybrid_store_restore_and_transaction_validation(
+    typed, device_index
+):
+    if device_index >= torch.npu.device_count():
+        pytest.skip("requested NPU is not visible")
+    torch.npu.set_device(device_index)
+    raw, config, caches = fixture(f"npu:{device_index}", typed)
     layout = build_layout(config, caches)
     region = SharedOffloadRegion(uuid.uuid4().hex, 4, 0, 4096, 48)
     worker = AscendLayoutWorker(layout, 2, 4, region)

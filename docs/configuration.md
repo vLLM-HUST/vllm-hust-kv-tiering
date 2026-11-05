@@ -11,6 +11,22 @@ manifest currently names exactly `0.25.1+frontier.bidkv.empty`; source-ABI suppo
 and manifest version matching are distinct checks. Re-test before upgrading the
 host, runtime, cache layout or plugin.
 
+For the paired Ascend commit `9bf964cb4b87c8cd0d6852c41a55b3c29711fa95`,
+its existing version-routing code needs `VLLM_VERSION=0.25.1` to select the
+available FLA implementation with this local-version core. This is a compatibility
+routing override, not proof of the installed distribution; record the actual
+`importlib.metadata` version separately. Preserve the inherited CANN
+`PYTHONPATH` and library paths when prepending this plugin's source path:
+overwriting `PYTHONPATH` hides the host-provided `acl` bindings and breaks model
+startup. Installed-wheel deployments should not need a source-path override.
+
+**Known frozen-host model gate:** real Native (no connector) testing of
+Qwen3.5 MTP2 + Mamba `align` reached readiness but failed on its first inference:
+the core calls the fused Mamba postprocess kernel with a newer ABI than the
+Ascend replacement (`block_size` bound twice). No host patch or kernel
+monkeypatch is supplied by this plugin. A no-MTP diagnostic does not qualify
+that MTP2 deployment profile; resolve the host pairing before production use.
+
 Runtime dependencies are deliberately empty. The host supplies torch, accelerator
 support and vLLM. The `dev` extra only installs test/build/lint tooling. No install
 step enables the plugin or starts a server.

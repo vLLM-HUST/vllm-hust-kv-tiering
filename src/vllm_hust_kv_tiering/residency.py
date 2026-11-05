@@ -94,8 +94,8 @@ def build_tiering_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         ),
         TieringMetrics.PRIMARY_RECLAIMED_BLOCKS: OffloadingCounterMetadata(
             documentation=(
-                "Number of idle CPU-primary blocks reclaimed after a secondary "
-                "copy became durable."
+                "Number of unpinned CPU-primary blocks reclaimed after a secondary "
+                "copy became readable; stable-media durability is configured separately."
             ),
             labelnames=("reason",),
         ),

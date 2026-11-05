@@ -169,6 +169,7 @@ class LifecycleAwareManager:
         self._shutdown_done = False
         self._counts: Counter[str] = Counter()
         self._metric_counts: Counter[str] = Counter()
+        self._lifecycle_metric_totals: Counter[str] = Counter()
         self._bytes_per_block, self._tokens_per_block = (
             bytes_per_block,
             tokens_per_block,
@@ -696,6 +697,23 @@ class LifecycleAwareManager:
         )
         stats.set_gauge(TieringMetrics.SHARED_BLOCKS, snapshot["shared_blocks"])
         stats.set_gauge(TieringMetrics.ACTIVE_BLOCKS, snapshot["active_blocks"])
+        sessions = self._lifecycle.snapshot()
+        stats.set_gauge(
+            TieringMetrics.SESSION_STATES, sessions["active_sessions"], ("active",)
+        )
+        stats.set_gauge(
+            TieringMetrics.SESSION_STATES, sessions["idle_sessions"], ("idle",)
+        )
+        stats.set_gauge(TieringMetrics.MIGRATION_BUDGET, self._step_blocks, ("step",))
+        for key, metric, labels in (
+            ("expired_sessions", TieringMetrics.EXPIRED_SESSIONS, ()),
+            ("cpu_reclaimed", TieringMetrics.PRIMARY_RECLAIMED_BLOCKS, ("policy",)),
+        ):
+            total = self._counts[key]
+            delta = total - self._lifecycle_metric_totals[key]
+            if delta:
+                stats.increase_counter(metric, delta, labels)
+            self._lifecycle_metric_totals[key] = total
         for reason, count in self._metric_counts.items():
             stats.increase_counter(
                 TieringMetrics.STORE_DECISIONS, count, ("observed", reason)
