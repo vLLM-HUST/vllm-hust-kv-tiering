@@ -7,6 +7,9 @@ secondary storage implementation through the host's ``hust_fs`` registry entry.
 
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
+from vllm_hust_kv_tiering.lifecycle import LifecycleConfig, SessionLifecycleManager
+from vllm_hust_kv_tiering.lifecycle_manager import LifecycleAwareManager
+
 
 class HustTieringOffloadingSpec(TieringOffloadingSpec):
     """Tiering spec pinned to the vLLM-HUST v1 offloading ABI."""
@@ -30,6 +33,21 @@ class HustTieringOffloadingSpec(TieringOffloadingSpec):
     def __init__(self, vllm_config, kv_cache_config):
         self._register_storage()
         super().__init__(vllm_config, kv_cache_config)
+        lifecycle_config = LifecycleConfig.from_extra_config(self.extra_config)
+        self._lifecycle = (
+            SessionLifecycleManager(lifecycle_config)
+            if lifecycle_config.enabled
+            else None
+        )
+        self._wrapped_manager = None
+
+    def get_manager(self):
+        manager = super().get_manager()
+        if self._lifecycle is None:
+            return manager
+        if self._wrapped_manager is None:
+            self._wrapped_manager = LifecycleAwareManager(manager, self._lifecycle)
+        return self._wrapped_manager
 
     @classmethod
     def build_metric_definitions(cls, extra_config):
