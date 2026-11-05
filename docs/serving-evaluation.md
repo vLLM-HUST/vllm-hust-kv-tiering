@@ -61,10 +61,6 @@ def message_text(messages):
     "spec_module_path": "vllm_hust_kv_tiering.spec",
     "cpu_bytes_to_use": 8589934592,
     "ascend_copy_backend": "torch_sync",
-    "tiering_hbm_pressure_aware": true,
-    "tiering_hbm_high_watermark": 0.70,
-    "tiering_hbm_low_watermark": 0.50,
-    "tiering_reclaim_device_cache_after_store": true,
     "secondary_tiers": [{
       "type": "hust_fs",
       "root_dir": "/root/CGCL/paiouyun-fs",
@@ -76,12 +72,9 @@ def message_text(messages):
 }
 ```
 
-两种 offload 策略：
-
-- **压力感知（生产）**：`tiering_hbm_pressure_aware: true`，只在 HBM 用量
-  超过 `high_watermark` 时 offload。
-- **主动 offload（测试用）**：`tiering_hbm_pressure_aware: false`，无条件
-  offload。用于在短上下文下强行制造 offload/reuse 场景。
+> 说明：历史评测里出现过的 `tiering_hbm_pressure_aware` / 各 watermark 等
+> key，当前代码并未读取；上面的 JSON 已移除它们。offload 的触发由宿主
+> `TieringOffloadingManager` 的默认策略决定，不构成插件的「压力感知」能力。
 
 ### 256K 显存配置
 
@@ -99,16 +92,15 @@ benchmark-only 证据政策，不落在本代码仓库；统一见 vLLM-HUST 官
 [FRONTIER-KV-TIERING-20260926.md](https://github.com/vLLM-HUST/vllm-hust-website/blob/main/docs/FRONTIER-KV-TIERING-20260926.md)。
 本节只保留定性结论与复现口径。
 
-### 3.1 32K Native vs Tiering（主动 offload）
+### 3.1 32K Native vs Tiering
 
-32K 短上下文下，主动 offload 的 store 开销几乎为 0（异步 stream/event 与
-decode 重叠），但也没有复用收益（KV 未超 HBM）。
+32K 短上下文下，Tiering 的 store 开销几乎为 0（异步 stream/event 与 decode
+重叠），但也没有复用收益（KV 未超 HBM）。
 
-### 3.2 256K 压力感知 store
+### 3.2 256K store
 
-256K + 压力感知下，HBM 到高水位线自动触发 offload，三级瀑布
-（HBM → DDR → SSD）正常工作；自然负载下无回读，复现了「只有写没有读」的
-现象。
+256K 交付配置下，FS 层收到 segment 写入，三级瀑布（HBM → DDR → SSD）的
+存储路径正常工作；自然负载下无回读，复现了「只有写没有读」的现象。
 
 ### 3.3 round-trip（最小恢复工况）
 
@@ -129,16 +121,16 @@ decode 重叠），但也没有复用收益（KV 未超 HBM）。
 - 对比 HBM-only（无分层，淘汰后重新 prefill）与 Tiering（分层，淘汰后从
   FS 读回）。
 
-定性结论：该工况下 Tiering 的吞吐与 TTFT 均显著优于 HBM-only，且
-`kv_offload_load_bytes` 确认发生了从 FS 的读回（而非 HBM 前缀缓存命中）——
-即「读回 > 重算」的恢复收益成立。具体数值、完整命令与原始数据见 PR 描述与
-benchmark 仓库证据。
+探索性观察（未 qualify、不作为正式性能声明）：该工况下 Tiering 的吞吐与
+TTFT 优于 HBM-only，且 `kv_offload_load_bytes` 确认发生了从 FS 的读回（而非
+HBM 前缀缓存命中）——即「读回 > 重算」的方向成立。具体数值与完整命令不在
+本仓库；是否纳入正式证据需在 benchmark 仓库统一归档后另行评审。
 
 ## 4. 复现命令
 
 ```bash
 # 数据集准备（见 §1）
-# 启动 serve（Tiering，压力感知，256K）
+# 启动 serve（Tiering，256K）
 VLLM_VERSION=0.25.1 vllm serve /models/Qwen3.5-35B-A3B \
   --served-model-name qwen3.5-35b-a3b --tensor-parallel-size 2 \
   --max-model-len 262144 --enable-prefix-caching \
