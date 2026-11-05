@@ -128,23 +128,10 @@ HBM 前缀缓存命中）——即「读回 > 重算」的方向成立。具体�
 
 ## 4. 复现命令
 
-```bash
-# 数据集准备（见 §1）
-# 启动 serve（Tiering，256K）
-VLLM_VERSION=0.25.1 vllm serve /models/Qwen3.5-35B-A3B \
-  --served-model-name qwen3.5-35b-a3b --tensor-parallel-size 2 \
-  --max-model-len 262144 --enable-prefix-caching \
-  --kv-cache-memory-bytes 26038239232 \
-  --kv-transfer-config "$(cat tiering-config.json)"
-
-# 压测
-vllm bench serve --backend vllm --base-url http://127.0.0.1:8000 \
-  --endpoint /v1/completions --model qwen3.5-35b-a3b \
-  --tokenizer /models/Qwen3.5-35B-A3B \
-  --dataset-name custom --dataset-path reuse_conversation.jsonl \
-  --num-prompts 800 --disable-shuffle --request-rate inf \
-  --max-concurrency 8 --temperature 0 --ignore-eos
-```
+「最小恢复工况」（小 KV 预算 + 合成多轮对话，用于触发读回）的可复现命令——
+含 serve 命令、干净的 tiering 配置、benchmark 命令——见
+[`benchmarks/README.md`](../benchmarks/README.md)。上面 §1/§2 描述的是历史
+评测口径（复用对话数据集 + 256K 交付配置），不保证能一键复现。
 
 ## 5. 已知边界
 
