@@ -545,10 +545,11 @@ class FileSystemTierManager(SecondaryTierManager):
                 # A caller resetting the underlying leaf counters directly is
                 # tolerated, though manager snapshots never reset them.
                 delta = value - previous if value >= previous else value
-                if delta:
-                    stats.increase_counter(
-                        _FS_METRIC_PREFIX + name, delta, (self.tier_type,)
-                    )
+                # Publish zero on first observation as well: a lazily missing
+                # label otherwise loses the first measured restore delta.
+                stats.increase_counter(
+                    _FS_METRIC_PREFIX + name, delta, (self.tier_type,)
+                )
             self._metric_snapshot = current
             stats.set_gauge(
                 _FS_METRIC_PREFIX + "pending_jobs",

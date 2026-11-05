@@ -20,7 +20,6 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
 from vllm.v1.kv_offload.tiering.base import JobMetadata
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
-
 from vllm_hust_kv_tiering.fs import manager as fs_manager
 from vllm_hust_kv_tiering.spec import HustTieringOffloadingSpec
 
@@ -365,6 +364,9 @@ def test_absolute_pathlike_root_is_accepted(make_tier, tmp_path):
 
 def test_fs_metrics_report_actual_io_once_without_resetting_snapshots(make_tier):
     tier, _ = make_tier()
+    initial = tier.get_stats().reduce()
+    assert initial["vllm:kv_tiering_fs_load_bytes:('hust_fs',)"] == 0
+    assert initial["vllm:kv_tiering_fs_checksum_errors:('hust_fs',)"] == 0
     tier.submit_store(job(1, [key()]))
     assert finish(tier)[0].success
     tier.submit_load(job(2, [key()], promotion=True))
@@ -378,7 +380,7 @@ def test_fs_metrics_report_actual_io_once_without_resetting_snapshots(make_tier)
     assert first[prefix + "load_bytes:('hust_fs',)"] == 4096
     assert first[prefix + "store_bytes:('hust_fs',)"] == 4096
     second = tier.get_stats().reduce()
-    assert prefix + "load_bytes:('hust_fs',)" not in second
+    assert second[prefix + "load_bytes:('hust_fs',)"] == 0
     assert tier.get_storage_counters()["load_bytes"] == 4096
     tier.get_storage_counters(reset=True)
     tier.submit_load(job(3, [key()], promotion=True))

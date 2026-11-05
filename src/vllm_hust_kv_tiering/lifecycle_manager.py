@@ -683,6 +683,10 @@ class LifecycleAwareManager:
         )
 
         stats = self._delegate.get_stats() or OffloadingConnectorStats()
+        # Frozen-host transfer series are label-lazy. Seed zero without
+        # inventing I/O so the first real restore has a visible baseline.
+        for name in ("vllm:kv_offload_load_bytes", "vllm:kv_offload_store_bytes"):
+            stats.increase_counter(name, 0)
         stats.set_gauge(TieringMetrics.DEVICE_CACHE_USAGE, self._hbm_usage)
         stats.set_gauge(
             TieringMetrics.PRESSURE_STATE, int(self._hbm_gate.active), ("device",)
@@ -711,8 +715,7 @@ class LifecycleAwareManager:
         ):
             total = self._counts[key]
             delta = total - self._lifecycle_metric_totals[key]
-            if delta:
-                stats.increase_counter(metric, delta, labels)
+            stats.increase_counter(metric, delta, labels)
             self._lifecycle_metric_totals[key] = total
         for reason, count in self._metric_counts.items():
             stats.increase_counter(

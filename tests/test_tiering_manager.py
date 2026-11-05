@@ -350,6 +350,9 @@ def test_lifecycle_prometheus_gauges_and_expiry_deltas(make_manager):
     manager, _, clock = make_manager(lifecycle=config)
     context = request(manager)
     first = manager.get_stats().reduce()
+    assert first["vllm:kv_offload_load_bytes"] == 0
+    assert first["vllm:kv_offload_store_bytes"] == 0
+    assert first[TieringMetrics.EXPIRED_SESSIONS] == 0
     assert first[TieringMetrics.SESSION_STATES + ":('active',)"] == 1
     assert first[TieringMetrics.SESSION_STATES + ":('idle',)"] == 0
     store(manager, context, [b"a"])
@@ -362,7 +365,7 @@ def test_lifecycle_prometheus_gauges_and_expiry_deltas(make_manager):
     expired = manager.get_stats().reduce()
     assert expired[TieringMetrics.SESSION_STATES + ":('idle',)"] == 0
     assert expired[TieringMetrics.EXPIRED_SESSIONS] == 1
-    assert TieringMetrics.EXPIRED_SESSIONS not in manager.get_stats().reduce()
+    assert manager.get_stats().reduce()[TieringMetrics.EXPIRED_SESSIONS] == 0
 
 
 def test_cpu_reclaim_metric_reports_completion_once(make_manager):
@@ -380,4 +383,4 @@ def test_cpu_reclaim_metric_reports_completion_once(make_manager):
     step(manager, clock)
     name = TieringMetrics.PRIMARY_RECLAIMED_BLOCKS + ":('policy',)"
     assert manager.get_stats().reduce()[name] == 1
-    assert name not in manager.get_stats().reduce()
+    assert manager.get_stats().reduce()[name] == 0
