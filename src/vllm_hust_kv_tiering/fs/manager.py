@@ -31,24 +31,28 @@ except ImportError:
 
 from typing_extensions import override
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.base import LookupResult, OffloadKey, ReqContext
-from vllm.v1.kv_offload.file_mapper import FileMapper
-from vllm.v1.kv_offload.tiering.base import SecondaryTierManager
-
-from vllm_hust_kv_tiering.async_lookup import AsyncLookupManager
-from vllm_hust_kv_tiering.base import (
-    JobMetadata,
-    JobResult,
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    OffloadKey,
+    ReqContext,
     RequestOffloadingContext,
     ScheduleEndContext,
-    TierDeleteResult,
 )
-from vllm_hust_kv_tiering.fs.io import load_block, store_block
+from vllm.v1.kv_offload.file_mapper import FileMapper
+from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
+from vllm.v1.kv_offload.tiering.base import (
+    JobMetadata,
+    JobResult,
+    SecondaryTierManager,
+)
+from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
+from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+
+from vllm_hust_kv_tiering.base import TierDeleteResult
 from vllm_hust_kv_tiering.fs.segment_store import (
     SegmentLocation,
     SegmentStore,
 )
-from vllm_hust_kv_tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
@@ -361,7 +365,6 @@ class FileSystemTierManager(SecondaryTierManager):
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
 
-    @override
     def delete(self, keys: Collection[OffloadKey]) -> TierDeleteResult:
         key_list = list(keys)
         deleted_keys = (
