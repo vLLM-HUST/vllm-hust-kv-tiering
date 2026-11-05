@@ -9,7 +9,6 @@ pytest.importorskip("vllm.v1.kv_offload.tiering.manager")
 
 from test_tiering_manager import make_manager as make_manager  # noqa: PLC0414 - pytest fixture re-export
 from test_tiering_manager import request, step
-
 from vllm_hust_kv_tiering.lifecycle import LifecycleConfig
 from vllm_hust_kv_tiering.policy import TieringPolicyConfig
 

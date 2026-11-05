@@ -5,7 +5,12 @@ group storing that block. Never reinterpret a shared SoA allocation as AoS:
 each layer is copied through the same tensor views used by the model runner.
 """
 
+import json
+import logging
+import os
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec, UniformTypeKVCacheSpecs
@@ -70,4 +75,113 @@ def build_layout(config, caches):
             refs.append(CanonicalKVCacheRef(len(layers), size))
             layers.append((index, rows))
         groups.append(refs)
-    return AscendLayout(pages, layers, groups)
+    layout = AscendLayout(pages, layers, groups)
+    _trace_layout(config, caches, layout)
+    return layout
+
+
+def _layout_trace_payload(config, caches, layout):
+    """Read tensor metadata only; never copy/read contents or launch kernels."""
+    storages, storage_ids = [], {}
+
+    def tensor_metadata(tensor):
+        storage = tensor.untyped_storage()
+        base, nbytes = int(storage.data_ptr()), int(storage.nbytes())
+        key = (str(tensor.device), base, nbytes)
+        if key not in storage_ids:
+            storage_ids[key] = f"storage-{len(storage_ids)}"
+            storages.append(
+                {
+                    "storage_id": storage_ids[key],
+                    "device": str(tensor.device),
+                    "nbytes": nbytes,
+                }
+            )
+        return {
+            "shape": [int(n) for n in tensor.shape],
+            "strides_elements": [int(n) for n in tensor.stride()],
+            "dtype": str(tensor.dtype),
+            "element_size_bytes": int(tensor.element_size()),
+            "storage_offset_elements": int(tensor.storage_offset()),
+            "storage_id": storage_ids[key],
+            "byte_offset": int(tensor.data_ptr()) - base,
+        }
+
+    rank, rank_source = None, "unavailable"
+    distributed = getattr(torch, "distributed", None)
+    if distributed is not None and distributed.is_initialized():
+        rank, rank_source = int(distributed.get_rank()), "torch.distributed.get_rank"
+    elif os.environ.get("RANK") is not None:
+        rank, rank_source = int(os.environ["RANK"]), "RANK environment"
+    payload = {
+        "schema": "ascend-layout-trace-v1",
+        "pid": os.getpid(),
+        "rank": rank,
+        "rank_source": rank_source,
+        "num_blocks": int(config.num_blocks),
+        "pointer_policy": "normalized storage IDs and relative byte offsets; no raw pointers or tensor contents",
+        "allocations": [
+            {
+                "allocation_index": i,
+                "size_bytes": int(allocation.size),
+                "page_bytes": int(layout.page_sizes[i]),
+                "block_stride": int(allocation.block_stride or 0),
+                "shared_by": list(allocation.shared_by),
+            }
+            for i, allocation in enumerate(config.kv_cache_tensors)
+        ],
+        "groups": [],
+        "layers": [],
+        "storages": storages,
+    }
+    index = 0
+    for group_id, group in enumerate(config.kv_cache_groups):
+        indices = []
+        for name in group.layer_names:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[name]
+            tensors = caches[name]
+            if isinstance(tensors, torch.Tensor):
+                tensors = (tensors,)
+            allocation, rows = layout.layers[index]
+            payload["layers"].append(
+                {
+                    "layer_index": index,
+                    "layer_name": name,
+                    "group_id": group_id,
+                    "allocation_index": int(allocation),
+                    "spec_type": type(spec).__name__,
+                    "block_size": int(spec.block_size),
+                    "spec_page_bytes": int(spec.page_size_bytes),
+                    "original_tensors": [tensor_metadata(tensor) for tensor in tensors],
+                    "byte_rows": [tensor_metadata(row) for row in rows],
+                }
+            )
+            indices.append(index)
+            index += 1
+        payload["groups"].append({"group_id": group_id, "layer_indices": indices})
+    return payload
+
+
+def _trace_layout(config, caches, layout):
+    directory = os.environ.get("HUST_TIERING_LAYOUT_TRACE")
+    if not directory:
+        return
+    try:
+        target = Path(directory).expanduser()
+        if not target.is_absolute():
+            raise ValueError(
+                "HUST_TIERING_LAYOUT_TRACE must name an absolute owned directory"
+            )
+        payload = _layout_trace_payload(config, caches, layout)
+        target.mkdir(parents=True, exist_ok=True)
+        rank = payload["rank"] if payload["rank"] is not None else "unknown"
+        path = target / f"layout-rank{rank}-pid{os.getpid()}-{uuid.uuid4().hex}.json"
+        with path.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, allow_nan=False)
+            handle.write("\n")
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Cannot write Ascend layout trace", exc_info=True
+        )
