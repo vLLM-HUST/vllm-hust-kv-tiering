@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from vllm.v1.kv_offload.base import (
@@ -171,20 +171,43 @@ class BlockResidencyState:
         return bool(self.inflight_transfers)
 
 
+class ResidencyCapacityError(RuntimeError):
+    """A residency mutation cannot be tracked without losing live ownership."""
+
+
 class BlockResidencyTracker:
     """Track residency, transfer state, and Session-to-Block ownership."""
 
-    def __init__(self, max_entries: int = 64_000):
-        if max_entries <= 0:
-            raise ValueError("residency_max_entries must be greater than zero")
+    def __init__(
+        self, max_entries: int = 64_000, clock: Callable[[], float] = time.monotonic
+    ):
+        if (
+            isinstance(max_entries, bool)
+            or not isinstance(max_entries, int)
+            or max_entries <= 0
+        ):
+            raise ValueError("residency_max_entries must be a positive integer")
         self.max_entries = max_entries
+        self._clock = clock
         self._blocks: dict[OffloadKey, BlockResidencyState] = {}
         self._session_keys: dict[str, set[OffloadKey]] = {}
         self._active_sessions: set[str] = set()
 
+    def __len__(self) -> int:
+        """Return metadata entry count without scanning residency state."""
+        return len(self._blocks)
+
+    def contains_entry(self, key: OffloadKey) -> bool:
+        """Test metadata presence, including entries without a resident copy."""
+        return key in self._blocks
+
+    def tracked_keys(self) -> set[OffloadKey]:
+        """Return a detached key snapshot for maintenance reconciliation."""
+        return set(self._blocks)
+
     def on_session_active(self, session_id: str) -> None:
         self._active_sessions.add(session_id)
-        now = time.monotonic()
+        now = self._clock()
         for key in self._session_keys.get(session_id, ()):
             state = self._blocks.get(key)
             if state is not None:
@@ -193,55 +216,74 @@ class BlockResidencyTracker:
 
     def on_session_idle(self, session_id: str) -> None:
         self._active_sessions.discard(session_id)
-        now = time.monotonic()
+        now = self._clock()
         for key in self._session_keys.get(session_id, ()):
             state = self._blocks.get(key)
-            if state is not None and not self._has_active_session(state):
+            if (
+                state is not None
+                and not self._has_active_session(state)
+                and state.idle_since is None
+            ):
                 state.idle_since = now
 
-    def record_access(self, session_id: str, keys: Iterable[OffloadKey]) -> None:
-        now = time.monotonic()
+    def record_access(self, session_id: str, keys: Iterable[OffloadKey]) -> bool:
+        key_list = list(dict.fromkeys(keys))
+        if not self.ensure_capacity(key_list):
+            return False
+        now = self._clock()
         session_keys = self._session_keys.setdefault(session_id, set())
-        for key in keys:
+        for key in key_list:
             state = self._get_or_create(key, now)
             state.session_ids.add(session_id)
             state.last_access_at = now
             state.access_count += 1
-            if session_id in self._active_sessions:
+            if self._has_active_session(state):
                 state.idle_since = None
+            elif state.idle_since is None:
+                state.idle_since = now
             session_keys.add(key)
+        return True
 
     def release_session(self, session_id: str) -> set[OffloadKey]:
         self._active_sessions.discard(session_id)
         keys = self._session_keys.pop(session_id, set())
         unreferenced: set[OffloadKey] = set()
-        now = time.monotonic()
+        now = self._clock()
         for key in keys:
             state = self._blocks.get(key)
             if state is None:
                 continue
             state.session_ids.discard(session_id)
             if not state.session_ids:
-                state.idle_since = state.idle_since or now
+                state.idle_since = now if state.idle_since is None else state.idle_since
                 unreferenced.add(key)
             elif not self._has_active_session(state):
-                state.idle_since = state.idle_since or now
+                state.idle_since = now if state.idle_since is None else state.idle_since
         return unreferenced
 
     def mark_cpu_resident(
         self, keys: Iterable[OffloadKey], resident: bool = True
     ) -> None:
-        now = time.monotonic()
-        for key in keys:
-            state = self._get_or_create(key, now)
-            state.cpu_resident = resident
+        key_list = list(dict.fromkeys(keys))
+        if resident:
+            self._require_capacity(key_list)
+        now = self._clock()
+        for key in key_list:
+            state = self._get_or_create(key, now) if resident else self._blocks.get(key)
+            if state is not None:
+                state.cpu_resident = resident
 
     def mark_secondary_resident(
         self, keys: Iterable[OffloadKey], tier: str, resident: bool = True
     ) -> None:
-        now = time.monotonic()
-        for key in keys:
-            state = self._get_or_create(key, now)
+        key_list = list(dict.fromkeys(keys))
+        if resident:
+            self._require_capacity(key_list)
+        now = self._clock()
+        for key in key_list:
+            state = self._get_or_create(key, now) if resident else self._blocks.get(key)
+            if state is None:
+                continue
             if resident:
                 state.secondary_tiers.add(tier)
             else:
@@ -250,9 +292,11 @@ class BlockResidencyTracker:
     def start_transfer(
         self, keys: Iterable[OffloadKey], source: str, target: str
     ) -> None:
-        now = time.monotonic()
+        key_list = list(dict.fromkeys(keys))
+        self._require_capacity(key_list)
+        now = self._clock()
         transfer = (source, target)
-        for key in keys:
+        for key in key_list:
             state = self._get_or_create(key, now)
             state.inflight_transfers[transfer] += 1
 
@@ -260,7 +304,7 @@ class BlockResidencyTracker:
         self, keys: Iterable[OffloadKey], source: str, target: str
     ) -> None:
         transfer = (source, target)
-        for key in keys:
+        for key in dict.fromkeys(keys):
             state = self._blocks.get(key)
             if state is None:
                 continue
@@ -276,6 +320,8 @@ class BlockResidencyTracker:
         limit: int,
         idle_before: float | None = None,
     ) -> list[OffloadKey]:
+        if limit <= 0:
+            return []
         candidates = [
             state
             for state in self._blocks.values()
@@ -305,6 +351,8 @@ class BlockResidencyTracker:
         are considered only as a last resort when CPU pressure cannot be
         relieved using idle state alone.
         """
+        if limit <= 0:
+            return []
         candidates = [
             state
             for state in self._blocks.values()
@@ -322,7 +370,7 @@ class BlockResidencyTracker:
                 state.is_shared,
                 state.access_count,
                 state.idle_since is None,
-                state.idle_since or state.last_access_at,
+                state.last_access_at if state.idle_since is None else state.idle_since,
                 state.last_access_at,
             )
         )
@@ -379,27 +427,54 @@ class BlockResidencyTracker:
             "active_blocks": active_blocks,
         }
 
-    def prune(self) -> int:
-        excess = len(self._blocks) - self.max_entries
-        if excess <= 0:
-            return 0
-        candidates = sorted(
+    def _prunable(self, protected: set[OffloadKey]) -> list[BlockResidencyState]:
+        return sorted(
             (
                 state
                 for state in self._blocks.values()
-                if not state.session_ids
+                if state.key not in protected
+                and not state.session_ids
                 and not state.cpu_resident
                 and not state.has_inflight_transfer
             ),
             key=lambda state: state.last_access_at,
         )
+
+    def ensure_capacity(self, keys: Iterable[OffloadKey]) -> bool:
+        """Reserve room atomically without forgetting active ownership.
+
+        Secondary-only, unowned hints can be forgotten; this is metadata
+        pruning, never evidence authorizing deletion of their actual files.
+        The caller must serialize ensure + mutation (all APIs are host-thread
+        confined), and supplied existing keys are protected from pruning.
+        """
+        requested = set(keys)
+        missing = requested.difference(self._blocks)
+        excess = len(self._blocks) + len(missing) - self.max_entries
+        if excess <= 0:
+            return True
+        candidates = self._prunable(requested)
+        if len(candidates) < excess:
+            return False
         for state in candidates[:excess]:
-            self._blocks.pop(state.key, None)
-        return min(excess, len(candidates))
+            del self._blocks[state.key]
+        return True
+
+    def _require_capacity(self, keys: Iterable[OffloadKey]) -> None:
+        if not self.ensure_capacity(keys):
+            raise ResidencyCapacityError("residency metadata capacity exhausted")
+
+    def prune(self) -> int:
+        excess = max(0, len(self._blocks) - self.max_entries)
+        candidates = self._prunable(set())[:excess]
+        for state in candidates:
+            del self._blocks[state.key]
+        return len(candidates)
 
     def _get_or_create(self, key: OffloadKey, now: float) -> BlockResidencyState:
         state = self._blocks.get(key)
         if state is None:
+            self._require_capacity((key,))
             state = BlockResidencyState(
                 key=key,
                 created_at=now,

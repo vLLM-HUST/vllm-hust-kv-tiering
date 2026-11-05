@@ -1,7 +1,7 @@
 {
   "schema_version": "0.3-experimental",
   "extension_id": "org.vllm-hust.kv-tiering",
-  "extension_version": "0.1.1.dev0",
+  "extension_version": "0.2.0.dev0",
   "kind": "kv_service_adapter",
   "host": {
     "provider": "hust-kv-tiering",

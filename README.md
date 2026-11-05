@@ -1,203 +1,154 @@
 # vllm-hust-kv-tiering
 
-Out-of-tree KV-cache tiering and filesystem persistence work for **vLLM-HUST
-v1** (`vllm 0.28.1rc0`).  It does not patch the vLLM
-source tree: v1's documented `spec_module_path` and secondary-tier loading
-contracts are the integration boundary.
+Development version: `0.2.0.dev0` (pressure/lifecycle safety rework; not a qualified release).
 
-## Features
+Out-of-tree, explicitly enabled KV prefix/state-cache tiering for the frozen
+**vLLM-HUST v1** host at core
+`d0f22d2bda562156e4dbf433ce645e1769b4f804` (`d0f22d`). The matched distribution
+line used for CPU integration validation is `0.25.1+frontier.bidkv`.
+The historical `.empty` capsule string remains in the ECPA discovery manifest;
+that distribution is not separately hardware-qualified here. This is **not** a
+compatibility claim for upstream vLLM or `0.28.x`.
 
-- device → CPU → filesystem placement with a segment-file + SQLite index and
-  batched `preadv` reads;
-- asynchronous read/write queues with read priority;
-- a v1-compatible `HustTieringOffloadingSpec` entry point;
-- an opt-in Ascend async store/load worker (`ascend_copy_backend: torch_sync`).
+The package adds **zero runtime dependencies**. Provision the matched host,
+PyTorch and accelerator runtime separately. Installing this package does not
+install or replace them, start a server, or enable offloading automatically.
 
-Planned but **not yet wired at runtime**: pressure-aware placement triggers
-(`tiering_hbm_pressure_aware` and its watermarks are accepted but not read by
-any code) and lifecycle/residency (session retention, TTL expiry, CPU
-demotion — the `lifecycle.py` / `residency.py` modules exist but are not
-instantiated by the spec).
+## Implemented behavior
 
-## Installation
+- Device → CPU cache admission driven by scheduler block-pool pressure, with
+  high/low hysteresis, preemption signals, bounded jobs and whole-request budgets.
+- CPU → filesystem spill and CPU reclamation based on occupancy or idle age.
+  A CPU copy is not reclaimed for a spill until a secondary write succeeds.
+- Session/shared-prefix ownership, request-versus-transfer finalization, optional
+  idle TTL, bounded metadata and asynchronous optional secondary deletion.
+- Segment files plus a SQLite index, bounded I/O admission, configurable read/write
+  threads, a payload quota, per-block CRC32/short-I/O checks and explicit durability modes.
+- An opt-in Ascend stream/event worker with fail-fast transfer fences and
+  conservative drain/teardown. CUDA uses the matched host's worker.
 
-Install this package into the same environment as the vLLM-HUST v1 release:
+These policies are wired into the runtime; they are not merely accepted options.
+They do **not** enlarge the active model's HBM working set or explicitly evict
+host GPU prefix-cache blocks. A rejected cache admission normally falls back to
+native inference/recomputation. An unproven device fence is fatal, not a safe
+cache miss.
+
+See [architecture](<docs/architecture.md>) for ownership and policy invariants,
+and [configuration](<docs/configuration.md>) for options and operating boundaries.
+
+## Install and enable
+
+Install into the environment that already contains the matched host:
 
 ```bash
-pip install -e .
+python -m pip install --no-deps .
 ```
 
-Select the out-of-tree spec in the offloading connector configuration:
+Use the generic plugin-owned `HustTieringConnector`, which binds the scheduler's
+pressure source while preserving host transfer scheduling. The module name
+retains its historical Ascend spelling, but the connector also supports the
+host CUDA path. Supplying only a spec to a different connector is not a substitute
+for this pressure binding.
+
+The complete [Ascend CPU+filesystem example](<examples/pressure-tiering.json>)
+selects `ascend_copy_backend: torch_async` for the target 910B runtime and uses:
+
+- Composite HBM cache-pressure high/low: `0.8` / `0.6`;
+- CPU occupancy high/low: `0.9` / `0.7`;
+- idle TTL: `300` seconds; secondary deletion: `false`;
+- CPU demotion age: `60` seconds;
+- 1 GiB CPU budget and a 64 GiB segment-payload quota;
+- two read-priority and two write-priority threads, with 64 admitted FS jobs.
+
+Review the absolute storage path, memory/filesystem budgets and permissions before
+starting an owned server:
+
+```bash
+vllm serve YOUR_MODEL --kv-transfer-config "$(cat examples/pressure-tiering.json)"
+```
+
+Use the [CPU-only example](<examples/cpu-only.json>) for the device→CPU comparison
+arm; it has `secondary_tiers: []`. Here “CPU-only” describes the offload tier,
+not CPU model execution. The Native arm omits the KV-transfer configuration.
+Do not combine this configuration with a conflicting connector configuration.
+
+### Ascend opt-in
+
+Both examples explicitly select the matched Ascend runtime with this entry
+inside `kv_connector_extra_config`:
 
 ```json
-{
-  "spec_name": "HustTieringOffloadingSpec",
-  "spec_module_path": "vllm_hust_kv_tiering.spec",
-  "cpu_bytes_to_use": 1073741824,
-  "secondary_tiers": [{
-    "type": "SegmentFileSystemTier",
-    "module_path": "vllm_hust_kv_tiering.fs.manager",
-    "root_dir": "/var/lib/vllm-kv",
-    "storage_layout": "segment"
-  }]
-}
+"ascend_copy_backend": "torch_async"
 ```
 
-`type: hust_fs` may be used after the package's general plugin is loaded. The
-explicit `module_path` form above is preferred because it is independent of
-plugin loading order.
+`torch_sync` is a supported legacy alias for the same stream/event adapter; it
+does **not** select a separate synchronous implementation.
+`HustAscendTieringConnector` remains a connector-name alias. For a separately
+qualified host CUDA/XPU deployment, **remove** `ascend_copy_backend` to use the
+host's worker; omitting it on an NPU host does not select the Ascend adapter.
+Unsupported cache layouts fail explicitly rather than silently copying a
+guessed layout.
 
-## Compatibility
+Requesting `copy_(..., non_blocking=True)` for mmap-backed CPU memory does not
+prove asynchronous overlap. No host-pinning heuristic is applied. Copy, event
+record/query/wait errors stop normal worker operation; failed fences raise and
+never return a fabricated successful completion. Shutdown retains views and the
+mmap if it cannot prove that the transfer stream has stopped, and can be retried.
 
-This package is intentionally pinned to the HUST v1 ABI. It must be tested
-again before upgrading vLLM, because offloading interfaces are experimental.
-Its ECPA 0.3 manifest exclusively claims the process-local KV transfer
-configuration and `hust_fs` secondary-tier registration. Installing the wheel
-only makes the extension discoverable; enablement remains explicit, and
-`runtime_effective` requires process-owned observer evidence.
+## Compatibility and safety boundary
 
-## Ownership and provenance
+The integration is deliberately version-bound. The host supplies factories,
+connector protocols, request scheduling, CPU allocation and transfer bookkeeping.
+Selective CPU reclamation additionally uses a small **private-host adapter**;
+not every accessed interface is public. Re-run actual-host ABI and transfer tests
+before changing the host, PyTorch, accelerator runtime, cache layout or policy.
 
-This is the owner-maintained extraction of the tiered KV-cache residency and
-lifecycle work from vLLM-HUST. See [MAINTAINERS.md](MAINTAINERS.md) and
-[PROVENANCE.md](PROVENANCE.md) for ownership, attribution, and migration
-history.
+The packaged ECPA manifest currently pins the exact
+`0.25.1+frontier.bidkv.empty` distribution string. Its discovery constraint is
+narrower than the matched source-ABI line described above. Wheel discovery is
+not runtime qualification or evidence of activation.
 
-## Experimental Ascend qualification branch
+CPU mmap capacity and filesystem capacity are separate resources. Provision
+sufficient `/dev/shm` for the host offload regions and other consumers. After an
+abnormal exit, identify the owning process before reclaiming stale resources;
+never delete a live process's mmap or cache directory. Use a separate storage
+namespace for incompatible models/configurations and qualification runs.
 
-This branch adds a **default-off** `ascend_copy_backend: torch_sync` adapter for
-the frozen Qwen3.5 Frontier capsule (`vllm` distribution
-`0.25.1+frontier.bidkv.empty`, core `d0f22d2bda562156e4dbf433ce645e1769b4f804`).
-CUDA/XPU paths continue using the host worker.
+## Tests and qualification
 
-The adapter now issues `copy_(..., non_blocking=True)` on a **dedicated NPU
-stream** and records a per-job `torch.npu.Event`: `submit_*` returns
-immediately, `get_finished()` polls the events, and `wait()` blocks on them.
-Store copies are ordered after the compute stream (`wait_stream`) so they read
-stable KV rather than racing the decode kernels; load completion is observed
-through the event. Errors surfaced at query/synchronize time are reported as
-`success=False` results instead of being raised out of the worker, and a job is
-reported at most once (`get_finished` removes it before reporting).
+Portable tests require neither torch nor vLLM and do not initialize hardware:
 
-Buffer ownership is documented: the worker holds long-lived *views* (not
-copies) into the host mmap region and the runner's KV-cache tensors, and the
-offloading manager pins the source/destination blocks for the duration of a
-job, so those views remain valid until the job's event is observed complete.
-The earlier revision (copy bracketed by `torch.npu.synchronize()`) was
-synchronous and did not overlap device transfer with compute; that has been
-replaced. **This remains an experimental adapter, not a production-default
-optimization.**
-
-## Evaluation status
-
-Two claims are deliberately kept separate:
-
-- **Save/store path is functional.** A real 910B2 partial-page two-group
-  NPU→CPU→NPU round trip, segment-file creation, and preservation of untouched
-  padding have been exercised. The connector, spec, `hust_fs` secondary tier,
-  and `/dev/shm` offload region all initialize and run.
-- **Recovery/reuse benefit is exploratory, not qualified.** Under the delivery
-  configuration (Qwen3.5-35B-A3B, 262144 context, 26 GB/card KV) the natural
-  `reuse_conversation` load reuses prefixes before HBM eviction, so it remains
-  write-only with no read-back — the same observation as the Frontier review.
-  A reduced-KV-budget minimal recovery scenario (with repeated prefixes) shows
-  the load path reads back from the FS tier instead of re-prefilling, but this
-  has not been qualified against the delivery config and is not a supported
-  performance claim. See
-  [`docs/serving-evaluation.md`](docs/serving-evaluation.md) for the
-  exploratory setup and boundaries.
-
-### Async rework measurement (2026-11, 32K smoke)
-
-After the dedicated-stream/event rework, a 200-request `reuse_conversation`
-run (Qwen3.5-35B-A3B, TP2, 32768 context, concurrency 8) wrote segment files
-into the FS tier. At this configuration the
-store path overlaps decode and adds no measurable cost. This is a 32K-context
-smoke result, not the 262144-context delivery line, and it still observed
-store-only traffic (no load), so the reuse benefit remains unestablished.
-
-### 256K delivery-line + round-trip (2026-11)
-
-On the 262144-context delivery config (explicit 26 GB KV budget per card), an
-800-request run wrote segment files into the FS tier, still with no read-back
-under natural load. An explicit minimal-recovery round trip
-(`reset_prefix_cache` then re-request) confirmed that reusing the FS-tier copy
-is faster than recomputing the prefix. Dataset, config, and reproduction
-commands are in [`docs/serving-evaluation.md`](docs/serving-evaluation.md); the
-measured results are recorded in the canonical
-[Frontier KV tiering evidence](https://github.com/vLLM-HUST/vllm-hust-website/blob/main/docs/FRONTIER-KV-TIERING-20260926.md).
-
-### Known boundaries (verified, not assumed)
-
-- **Load/reuse needs real HBM pressure.** An evicted HBM block is only read
-  back from the FS tier when a later request actually reuses it after eviction;
-  a repeated-prefix request at low pressure hits the HBM prefix cache and does
-  **not** read back. At 32K context the hybrid model's Mamba cache also imposes
-  a floor: `gpu_memory_utilization` below ~0.62 is rejected
-  (`max_num_seqs > available Mamba cache blocks`), so the KV budget cannot be
-  shrunk far enough to force eviction. Establishing reuse therefore requires
-  the 262144-context delivery line (or equivalent pressure), not a 32K smoke.
-- **`/dev/shm` is a bounded tmpfs.** The CPU offload region is mmap'd under
-  `/dev/shm` (`vllm_offload_*.mmap`). An 8 GiB `cpu_bytes_to_use` plus stale
-  files from prior `kill -9` runs can fill the default 16 GiB mount and make
-  the next `SharedOffloadRegion` fail with `madvise: Bad address`. Clean
-  `/dev/shm/vllm_offload_*.mmap` after an abnormal shutdown, or provision a
-  larger `/dev/shm` for bigger CPU tiers.
-
-Provision the matched host separately and install this wheel normally; the
-package has no runtime dependencies and does not replace the accelerator
-runtime. Enable the connector directly through the vLLM KV-transfer config
-(`cpu_bytes_to_use` is a positive integer and `root_dir` an absolute path):
-
-```json
-{
-  "kv_connector": "HustAscendTieringConnector",
-  "kv_connector_module_path": "vllm_hust_kv_tiering.ascend_connector",
-  "kv_role": "kv_both",
-  "kv_connector_extra_config": {
-    "spec_name": "HustTieringOffloadingSpec",
-    "spec_module_path": "vllm_hust_kv_tiering.spec",
-    "cpu_bytes_to_use": 1073741824,
-    "ascend_copy_backend": "torch_sync",
-    "secondary_tiers": [{
-      "type": "hust_fs",
-      "root_dir": "/var/lib/vllm-kv",
-      "storage_layout": "segment",
-      "n_read_threads": 2,
-      "n_write_threads": 2
-    }]
-  }
-}
+```bash
+python -m pip install -e '.[dev]'
+python -m pytest -q \
+  tests/test_policy.py tests/test_lifecycle_state.py \
+  tests/test_async_worker_safety.py tests/test_segment_store_safety.py
 ```
 
-Pass it to the server, for example via `--kv-transfer-config tiering.json`.
-The connector does not change APC, MTP2, asynchronous scheduling, graph mode,
-context capacity or parallelism. An existing conflicting `--kv-transfer-config`
-is rejected. The installed host requires sufficient `/dev/shm` for the primary
-buffer. Use a fresh storage directory for qualification.
+The full suite skips host-dependent modules when their dependencies are absent.
+The original real-NPU tests are preserved and additionally require explicit
+operator consent on a suitable, isolated device:
 
-Validation so far includes a real 910B2 partial-page two-group NPU→CPU→NPU
-round trip and preservation of untouched padding. Full-model correctness,
-actual cache reuse, performance, and recovery must pass before production use
-or Frontier publication. Disable by dropping `--kv-transfer-config` and
-restarting the owned server to return to the Native arm; uninstalling is a
-separate package operation.
+```bash
+VLLM_KV_TIERING_RUN_NPU_TESTS=1 python -m pytest -m npu \
+  tests/test_ascend_worker.py tests/test_ascend_layout.py
+```
 
-[`examples/ecpa-tiering.json`](examples/ecpa-tiering.json) is a minimal
-non-production configuration for contract and clean-wheel validation.
+Portable safety tests, wheel imports and frozen-host CPU integration tests do not
+establish real-device correctness, serving stability, crash recovery, overlap or
+performance. The current pressure/lifecycle policy changes are **not hardware-
+qualified**. This README makes no measured throughput, latency or reuse-benefit
+claim. Historical evaluation notes are not qualification of the current code.
+Compare Native, CPU-only and CPU+filesystem under the same frozen workload;
+filesystem completed-read evidence is required to claim filesystem recovery.
 
-The experimental Ascend profile uses a plugin-owned connector to pack logical
-blocks from the runner's separate K/V and Mamba state views. CPU slots remain
-shared according to the host allocation map; padding is not read as live state.
-Packed allocations and layouts that require copying to form a view are rejected.
-This addresses the Tensor-only registration failure found in the first full-model
-Frontier attempt. Full-model qualification is still required before publishing
-performance or treating this adapter as a supported release.
+## Rollback and ownership
 
-## Canonical MOD metadata
+Remove `--kv-transfer-config` and restart the owned server to return to Native;
+uninstallation is a separate operation. Do not abandon a process holding an
+unproven transfer fence and reuse its storage in another live process.
 
-Repository identity, directly responsible maintainers, advisor status, default-off
-activation, rollback, scope, and evidence qualification are recorded in
-[`MOD_METADATA.json`](MOD_METADATA.json). `advisor_status: unknown` is not the
-same as confirmed `none`. Performance statements remain limited to the workloads
-and evidence labels recorded there; they are not general online claims.
+See [maintainers](<MAINTAINERS.md>), [provenance](<PROVENANCE.md>) and
+[MOD metadata](<MOD_METADATA.json>) for ownership, attribution and historical
+qualification labels. The [ECPA example](<examples/ecpa-tiering.json>) is a
+minimal contract fixture, not the bounded deployment example above.

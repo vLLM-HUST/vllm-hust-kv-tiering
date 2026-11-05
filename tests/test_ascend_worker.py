@@ -1,7 +1,12 @@
+import os
 import uuid
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("vllm.v1.kv_offload.base")
+pytestmark = pytest.mark.host
+
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
@@ -27,9 +32,12 @@ def test_group_alignment_and_padding():
         copy_plan(gpu, CPULoadStoreSpec([4]), refs, 2)
 
 
+@pytest.mark.npu
 @pytest.mark.skipif(
-    not hasattr(torch, "npu") or not torch.npu.is_available(),
-    reason="requires real Ascend",
+    os.environ.get("VLLM_KV_TIERING_RUN_NPU_TESTS") != "1"
+    or not hasattr(torch, "npu")
+    or not torch.npu.is_available(),
+    reason="requires VLLM_KV_TIERING_RUN_NPU_TESTS=1 and an available real Ascend NPU",
 )
 def test_real_npu_hybrid_partial_page_round_trip(tmp_path):
     torch.npu.set_device(0)

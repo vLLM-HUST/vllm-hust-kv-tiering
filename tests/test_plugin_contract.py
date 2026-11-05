@@ -1,3 +1,9 @@
+import pytest
+
+pytest.importorskip("torch")
+pytest.importorskip("vllm.v1.kv_offload.tiering.base")
+pytestmark = pytest.mark.host
+
 from vllm_hust_kv_tiering import register
 from vllm_hust_kv_tiering.fs.manager import SegmentFileSystemTier
 from vllm_hust_kv_tiering.spec import HustTieringOffloadingSpec

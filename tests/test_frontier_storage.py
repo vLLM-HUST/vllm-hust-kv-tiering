@@ -1,8 +1,13 @@
 import mmap
 from types import SimpleNamespace
 
-import numpy as np
-import torch
+import pytest
+
+np = pytest.importorskip("numpy")
+torch = pytest.importorskip("torch")
+pytest.importorskip("vllm.v1.kv_offload.tiering.base")
+pytestmark = pytest.mark.host
+
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 from vllm.v1.kv_offload.base import make_offload_key
 from vllm.v1.kv_offload.tiering.base import JobMetadata

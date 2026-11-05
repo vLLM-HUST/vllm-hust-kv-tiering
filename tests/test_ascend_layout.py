@@ -1,7 +1,12 @@
+import os
 import uuid
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("vllm.v1.kv_cache_interface")
+pytestmark = pytest.mark.host
+
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -86,8 +91,12 @@ def test_logical_rows_retain_runner_storage_and_share_cpu_allocation():
         build_layout(config, caches)
 
 
+@pytest.mark.npu
 @pytest.mark.skipif(
-    not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires NPU"
+    os.environ.get("VLLM_KV_TIERING_RUN_NPU_TESTS") != "1"
+    or not hasattr(torch, "npu")
+    or not torch.npu.is_available(),
+    reason="requires VLLM_KV_TIERING_RUN_NPU_TESTS=1 and an available real Ascend NPU",
 )
 @pytest.mark.parametrize("typed", [False, True])
 def test_real_npu_soa_hybrid_store_restore_and_transaction_validation(typed):

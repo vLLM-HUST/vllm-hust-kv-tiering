@@ -1,145 +1,102 @@
-# Serving evaluation (2026-11)
+# Serving validation status and acceptance protocol
 
-KV tiering 插件的 serving 性能评测记录：数据集来源、测试配置、复现步骤与定性结论。
+The current policy/lifecycle implementation is **not hardware-qualified**. No
+throughput, TTFT, TPOT or overlap result from an earlier commit establishes the
+behavior of this implementation. `MOD_METADATA.json` remains experimental and
+unqualified. Passing software tests is not a serving-performance claim.
 
-## 1. 测试数据集
+## Three separate questions
 
-**来源**：派欧云（paiouyun）服务负载数据集的「复用对话」子集
-`reuse_conversation.jsonl`。
+1. **Correctness:** are Attention KV and hybrid GDN/Mamba state restored with the
+   required alignment and unchanged model behavior, including abort/preemption,
+   shared prefixes, TTL and transfer failures?
+2. **Delivery-line non-regression:** under the frozen Qwen3.5-35B-A3B BF16,
+   2×910B2/TP2, 262144 context and 26038239232 KV bytes/card contract, does enabling
+   this plugin avoid a meaningful throughput/SLO regression?
+3. **Recovery benefit:** under an explicitly approved pressure/repeated-prefix
+   contract, is completed FS recovery faster than recomputation, after separating
+   DDR hits from filesystem hits and accounting for write cost?
 
-- 原始归档：`vLLM-HUST/kv-tiering-evaluation-backup` 仓库的
-  `dataset-archive/paiouyun-testset.tar.gz.part-*`（6 个分片，`cat` 合并后
-  `tar -xzf` 解压）。
-- 解压后路径：`派欧云/final_workloaddata_v2/final_workloaddata_v2/reuse_conversation.jsonl`。
-- 规模：**5000 条**。每条是一次多轮对话，含一个**组内共享的上下文前缀**
-  （`group_id` 相同则前缀相同）加不同的用户查询，是构造「重复前缀复用」的
-  最小负载。
+A positive answer to one does not establish the others. A CPU-only cache can
+improve TTFT without a single FS read. A completed NPU→CPU→NPU byte roundtrip is
+not full-model hybrid-state correctness. A reduced-budget scenario is
+supplementary evidence, not the unchanged delivery configuration.
 
-### 数据集准备
+## Freeze before running
 
-原始 JSONL 是多轮 `messages` 结构，需转成 vLLM 的 CustomDataset 格式
-（`{"prompt": ..., "output_tokens": ...}`）：
+Use the active `vllm-hust-benchmark` acceptance contract and the authorized
+Pujiang datasets. Preserve their original input/response protocol, identities,
+order and hashes; do not silently flatten multi-turn messages, invent prompts,
+truncate contexts or replace specified data with a convenient synthetic trace.
+The small generated workload in `benchmarks/` is a diagnostic fixture only.
 
-```python
-def message_text(messages):
-    parts = []
-    for m in messages or []:
-        content = m.get("content", "")
-        if isinstance(content, list):
-            content = "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
-        parts.append(f"[{m.get('role', 'user')}]\n{content}")
-    return "\n\n".join(parts)
+Record immutable identities for:
 
-# 每条：prompt = flatten(messages), output_tokens = metadata.output_tokens_target
-```
+- plugin/core/Ascend commits; wheel hashes; container/driver/CANN/torch/torch_npu;
+- model weights/revision, tokenizer and chat-template hashes;
+- complete server argv, effective configuration and request/scoring contract;
+- source/prepared dataset hashes, subset, request IDs, session IDs and ordering;
+- pressure thresholds, CPU budget, FS quota/durability, storage device/mount,
+  thread limits, concurrency, cache warmup/reset and measurement windows.
 
-转换后的 `reuse_conversation.jsonl` 每条约 5900 字符（~3000 tokens），
-`output_tokens` 默认 384。
+A `VLLM_VERSION` environment variable is not version provenance. Use a separate
+cache namespace for immutable model/configuration generations. Do not hot-update
+weights while continuing to serve persisted KV from the old generation.
 
-## 2. 测试配置
+## Paired arms
 
-### 强制基线（email #2 / V5.5 对齐）
+Run Native (no connector), CPU-only (`examples/cpu-only.json`) and CPU+FS
+(`examples/pressure-tiering.json`) with the same host/model, HBM budget and client
+contract. The CPU-only arm describes the offload tier, not CPU model execution.
+Do not start concurrent full-model arms on a two-card host unless the resource
+contract explicitly permits it.
 
-| 项 | 值 |
-| --- | --- |
-| 模型 | Qwen3.5-35B-A3B |
-| 精度 | BF16 |
-| 硬件 | 2 × Ascend 910B2 / TP2 |
-| 上下文 | 32768（32K）或 262144（256K） |
-| prefix caching | 开启 |
-| 并发 | 8（`--max-concurrency 8`） |
+Use independent storage namespaces and declared cold/warm-cache treatment. Freeze
+warmup and window boundaries before measurement; retain every submitted request,
+failure and timeout. If the host multi-turn driver uses early stop, declare its
+sampling rule or disable it (`--no-early-stop`); do not call an incomplete sample
+an entire-dataset run. Repeat/interleave arms as the benchmark contract requires,
+and report uncertainty rather than selecting the best run.
 
-### Tiering 配置（`kv-transfer-config`）
+## Evidence and metrics
 
-```json
-{
-  "kv_connector": "HustAscendTieringConnector",
-  "kv_connector_module_path": "vllm_hust_kv_tiering.ascend_connector",
-  "kv_role": "kv_both",
-  "kv_connector_extra_config": {
-    "spec_name": "HustTieringOffloadingSpec",
-    "spec_module_path": "vllm_hust_kv_tiering.spec",
-    "cpu_bytes_to_use": 8589934592,
-    "ascend_copy_backend": "torch_sync",
-    "secondary_tiers": [{
-      "type": "hust_fs",
-      "root_dir": "/root/CGCL/paiouyun-fs",
-      "storage_layout": "segment",
-      "n_read_threads": 4,
-      "n_write_threads": 4
-    }]
-  }
-}
-```
+Collect Prometheus snapshots and original per-request streaming times. Keep the
+following paths separate:
 
-> 说明：历史评测里出现过的 `tiering_hbm_pressure_aware` / 各 watermark 等
-> key，当前代码并未读取；上面的 JSON 已移除它们。offload 的触发由宿主
-> `TieringOffloadingManager` 的默认策略决定，不构成插件的「压力感知」能力。
+- `vllm:kv_offload_load_bytes`: CPU→device adapter traffic, **not FS traffic**;
+- `vllm:kv_tiering_fs_load_bytes`: actual filesystem read bytes;
+- `vllm:kv_tiering_fs_load_hits`: blocks read successfully from FS;
+- `vllm:kv_tiering_fs_store_bytes`: actual segment write bytes;
+- `vllm:kv_tiering_fs_*errors` (including `checksum_errors`), `queue_rejections`, `capacity_rejections`:
+  failed/dropped cache opportunities;
+- policy pressure, residency and admission-decision observations.
 
-### 256K 显存配置
+Prometheus exporters may append `_total` to counter names. Match labels and use
+before/after deltas for the owned process and measurement window. FS counter
+increases establish filesystem I/O, not a physical SSD cache miss or performance
+gain by themselves; document O_DIRECT/page-cache/storage semantics. In addition
+to FS counters, require a successful completed promotion, request-level reuse
+attribution, actual prefix eviction, and output/state correctness evidence.
 
-256K 上下文需显式 KV 预算（`--gpu-memory-utilization` 会算不足）：
+Report throughput, successful/SLO-compliant output tokens, TTFT and TPOT mean and
+p95/p99, failed/cancelled/timed-out requests, recomputed/prefilled tokens,
+CPU/HBM occupancy, FS bytes/errors and write amplification. Do not hide a TPOT
+regression behind improved aggregate request throughput.
 
-```bash
---max-model-len 262144 \
---kv-cache-memory-bytes 26038239232   # email #2 的「每卡 KV 26GB」
-```
+## Software and device validation gates
 
-## 3. 定性结论
+See `README.md` for portable and explicitly enabled NPU tests. On the matched
+host, CPU integration tests cover the actual factory/spec/connector/primary/FS
+contracts without running a model. These tests are useful prerequisites, not a
+replacement for the serving protocol above.
 
-实测数据（吞吐、TTFT、TPOT、加速比、store/load 字节数）遵循仓库的
-benchmark-only 证据政策，不落在本代码仓库；统一见 vLLM-HUST 官网证据页
-[FRONTIER-KV-TIERING-20260926.md](https://github.com/vLLM-HUST/vllm-hust-website/blob/main/docs/FRONTIER-KV-TIERING-20260926.md)。
-本节只保留定性结论与复现口径。
+Before claiming true async overlap, measure submit latency and collect stream
+traces for the matched torch_npu/mmap path. `non_blocking=True` is a request, not
+proof that the runtime avoids synchronous staging. Test device coherence,
+preemption/reuse fences, cancellation and conservative shutdown separately.
 
-### 3.1 32K Native vs Tiering
-
-32K 短上下文下，Tiering 的 store 开销几乎为 0（异步 stream/event 与 decode
-重叠），但也没有复用收益（KV 未超 HBM）。
-
-### 3.2 256K store
-
-256K 交付配置下，FS 层收到 segment 写入，三级瀑布（HBM → DDR → SSD）的
-存储路径正常工作；自然负载下无回读，复现了「只有写没有读」的现象。
-
-### 3.3 round-trip（最小恢复工况）
-
-流程：发长请求（冷 prefill）→ offload 到 FS → `POST /reset_prefix_cache`
-强制淘汰 HBM → 重发相同请求（从 FS load）。
-
-复用已淘汰的 KV 时，分层「从 SSD 读回」比「重新 prefill」更快，且真实长
-前缀下 prefill 耗时远高于 load，加速优势随前缀长度增大。
-
-### 3.4 多轮对话最小恢复工况（真实缓存压力 + 重复前缀）
-
-负责人 issue #2 要求的「真实缓存压力 + 重复前缀的最小恢复工况」用合成多轮
-对话负载复现：
-
-- 24 个对话，每个含一段共享前缀 + 一段独有前缀 + 15~25 轮（后续轮次复用
-  前面的 KV，构成重复前缀）；
-- 将 KV 预算压小（每卡 1.5 GB）以制造真实的 HBM 淘汰压力；
-- 对比 HBM-only（无分层，淘汰后重新 prefill）与 Tiering（分层，淘汰后从
-  FS 读回）。
-
-探索性观察（未 qualify、不作为正式性能声明）：该工况下 Tiering 的吞吐与
-TTFT 优于 HBM-only，且 `kv_offload_load_bytes` 确认发生了从 FS 的读回（而非
-HBM 前缀缓存命中）——即「读回 > 重算」的方向成立。具体数值与完整命令不在
-本仓库；是否纳入正式证据需在 benchmark 仓库统一归档后另行评审。
-
-## 4. 复现命令
-
-「最小恢复工况」（小 KV 预算 + 合成多轮对话，用于触发读回）的可复现命令——
-含 serve 命令、干净的 tiering 配置、benchmark 命令——见
-[`benchmarks/README.md`](../benchmarks/README.md)。上面 §1/§2 描述的是历史
-评测口径（复用对话数据集 + 256K 交付配置），不保证能一键复现。
-
-## 5. 已知边界
-
-1. **复用（load）不自然触发**：`reuse_conversation` 的同组复用发生在 HBM
-   淘汰之前，故连续负载下无 FS 回读。要触发 load 需显式的最小恢复工况
-   （`reset_prefix_cache` + 重发），或负载的 KV 真正超过 HBM。
-2. **`/dev/shm` 是 16GB tmpfs**：8GB CPU offload 层 mmap 在 `/dev/shm`，异常
-   退出（`kill -9`）会残留 `vllm_offload_*.mmap`，占满后导致
-   `madvise: Bad address`。需手动清理或增大 `/dev/shm`。
-3. **32K 下压小 KV 预算受限**：混合模型的 Mamba cache 要求
-   `max_num_seqs ≤ Mamba blocks`，`gpu_memory_utilization` 过低会被拒。
+Keep actual experimental evidence in `vllm-hust-benchmark` or the separately
+approved evidence destination. This code repository contains mechanisms,
+configuration and validation entry points, not fabricated or copied performance
+results. Historical Frontier evidence remains historical; link a new immutable
+record only after the current code has been measured and independently checked.
