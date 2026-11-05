@@ -30,11 +30,11 @@ except ImportError:
     _HAS_BATCH_LOOKUP_C = False
 
 from typing_extensions import override
-
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import LookupResult, OffloadKey, ReqContext
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.base import SecondaryTierManager
+
 from vllm_hust_kv_tiering.async_lookup import AsyncLookupManager
 from vllm_hust_kv_tiering.base import (
     JobMetadata,

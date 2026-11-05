@@ -44,7 +44,9 @@ def build_layout(config, caches):
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = spec.kv_cache_specs[name]
             if not isinstance(spec, (AttentionSpec, MambaSpec)):
-                raise ValueError("unsupported Ascend cache spec")
+                raise ValueError(  # noqa: TRY004 - pre-existing contract
+                    "unsupported Ascend cache spec"
+                )
             index = allocation_by_layer[name]
             if index in used:
                 raise ValueError("multiple layers in one group share an allocation")

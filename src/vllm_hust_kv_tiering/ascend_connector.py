@@ -2,11 +2,10 @@
 
 import os
 
-from vllm.logger import init_logger
-
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.logger import init_logger
 
 from vllm_hust_kv_tiering.ascend_layout import build_layout
 

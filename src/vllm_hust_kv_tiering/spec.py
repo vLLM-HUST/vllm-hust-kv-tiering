@@ -14,6 +14,7 @@ class HustTieringOffloadingSpec(TieringOffloadingSpec):
     @staticmethod
     def _register_storage():
         from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+
         from vllm_hust_kv_tiering.fs.manager import SegmentFileSystemTier
 
         if "hust_fs" not in SecondaryTierFactory._registry:
@@ -44,9 +45,12 @@ class HustTieringOffloadingSpec(TieringOffloadingSpec):
         import torch
         from vllm.distributed import get_world_group
         from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
-        from vllm_hust_kv_tiering.ascend_worker import AscendCopyWorker
-        from vllm_hust_kv_tiering.ascend_worker import AscendLayoutWorker
+
         from vllm_hust_kv_tiering.ascend_layout import AscendLayout
+        from vllm_hust_kv_tiering.ascend_worker import (
+            AscendCopyWorker,
+            AscendLayoutWorker,
+        )
 
         if not hasattr(torch, "npu"):
             raise ValueError("torch_sync requires the Ascend runtime")

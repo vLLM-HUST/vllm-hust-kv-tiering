@@ -1,4 +1,20 @@
 {
-  "cpu_bytes_to_use": 8388608,
-  "storage_directory": "/tmp/ecpa-kv-tiering"
+  "kv_connector": "HustAscendTieringConnector",
+  "kv_connector_module_path": "vllm_hust_kv_tiering.ascend_connector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "spec_name": "HustTieringOffloadingSpec",
+    "spec_module_path": "vllm_hust_kv_tiering.spec",
+    "cpu_bytes_to_use": 8388608,
+    "ascend_copy_backend": "torch_sync",
+    "secondary_tiers": [
+      {
+        "type": "hust_fs",
+        "root_dir": "/tmp/ecpa-kv-tiering",
+        "storage_layout": "segment",
+        "n_read_threads": 2,
+        "n_write_threads": 2
+      }
+    ]
+  }
 }
