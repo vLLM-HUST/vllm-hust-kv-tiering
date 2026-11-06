@@ -13,10 +13,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
     MambaSpec,
+    MLAAttentionSpec,
 )
 from vllm.v1.kv_offload.base import GPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
 from vllm_hust_kv_tiering.ascend_layout import build_layout
 from vllm_hust_kv_tiering.ascend_worker import AscendLayoutWorker
 
@@ -114,6 +116,80 @@ def test_rejects_a_nonleading_logical_block_axis():
     caches["attn"] = (raw[32:64].view(2, 16), caches["attn"][1])
     with pytest.raises(ValueError, match="leading block axis"):
         build_layout(config, caches)
+
+
+def test_rejects_combined_kv_tensor_when_two_blocks_hide_nonleading_axis():
+    raw = torch.arange(16, dtype=torch.int8)
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=1, dtype=torch.int8
+    )
+    config = KVCacheConfig(
+        2, [KVCacheTensor(16, ["attn"])], [KVCacheGroupSpec(["attn"], spec)]
+    )
+    # Old divisibility check accepted shape[0] == count == 2 but silently
+    # grouped K0+K1 instead of K0+V0 into canonical block0.
+    combined = raw.view(2, 2, 4, 1, 1)
+    before = raw.clone()
+    with pytest.raises(ValueError, match="separate K/V tensor views"):
+        build_layout(config, {"attn": combined})
+    assert torch.equal(raw, before)
+
+
+@pytest.mark.parametrize("form", ["missing_v", "extra_plane", "non_tensor"])
+def test_full_attention_rejects_unknown_plane_contract(form):
+    _, config, caches = fixture()
+    k, v = caches["attn"]
+    caches["attn"] = {
+        "missing_v": [k],
+        "extra_plane": [k, v, k],
+        "non_tensor": [k, object()],
+    }[form]
+    with pytest.raises(ValueError, match="separate K/V|must be torch tensors"):
+        build_layout(config, caches)
+
+
+@pytest.mark.parametrize("form", ["state_count", "single_tensor", "shape", "dtype"])
+def test_mamba_rejects_views_not_matching_declared_state_contract(form):
+    _, config, caches = fixture()
+    if form == "state_count":
+        caches["mamba"] = caches["mamba"][:1]
+    elif form == "single_tensor":
+        caches["mamba"] = caches["mamba"][0]
+    elif form == "shape":
+        caches["mamba"][0] = caches["mamba"][0].view(8, 4)
+    else:
+        caches["mamba"][0] = caches["mamba"][0].to(torch.uint8)
+    with pytest.raises(
+        ValueError, match="declared state views|state view shape|state view dtype"
+    ):
+        build_layout(config, caches)
+
+
+@pytest.mark.parametrize("single_tensor", [False, True])
+def test_one_state_mamba_accepts_exact_declared_single_view(single_tensor):
+    state = torch.arange(16, dtype=torch.int8).view(2, 8)
+    spec = MambaSpec(
+        block_size=8, shapes=((8,),), dtypes=(torch.int8,), mamba_cache_mode="align"
+    )
+    config = KVCacheConfig(
+        2, [KVCacheTensor(16, ["mamba"])], [KVCacheGroupSpec(["mamba"], spec)]
+    )
+    layout = build_layout(config, {"mamba": state if single_tensor else [state]})
+    assert layout.group_data_refs[0][0].page_size_bytes == 8
+    assert layout.layers[0][1][0].data_ptr() == state.data_ptr()
+
+
+def test_mla_is_not_accidentally_treated_as_two_plane_full_attention():
+    # MLAAttentionSpec inherits FullAttentionSpec, but has a separate cache
+    # contract. Preserve this pre-existing safe single-plane form; it does not
+    # qualify arbitrary MLA formats or make all FullAttention tensors acceptable.
+    state = torch.arange(32, dtype=torch.int8).view(2, 4, 1, 4)
+    spec = MLAAttentionSpec(block_size=4, num_kv_heads=1, head_size=4, dtype=torch.int8)
+    config = KVCacheConfig(
+        2, [KVCacheTensor(32, ["mla"])], [KVCacheGroupSpec(["mla"], spec)]
+    )
+    layout = build_layout(config, {"mla": state})
+    assert layout.layers[0][1][0].shape == (2, 16)
 
 
 @pytest.mark.npu

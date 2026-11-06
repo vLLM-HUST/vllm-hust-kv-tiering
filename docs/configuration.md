@@ -57,6 +57,15 @@ retain the host worker. Omitting it on Ascend does not auto-detect/select this
 NPU adapter. “CPU-only” means NPU↔CPU offload without a filesystem secondary,
 not CPU model execution.
 
+The Ascend logical builder validates known runner forms rather than inferring
+all semantics from shape divisibility. Non-MLA `FullAttentionSpec` caches require
+an explicit two-view K/V tuple/list; a combined planes-first tensor is rejected,
+even when two blocks make its first dimension appear valid. Mamba views must
+match the exact declared state count, `(num_blocks, *state_shape)` and dtype;
+a single tensor is accepted only for an exact one-state spec. MLA has a separate
+contract and is not newly qualified by these checks. The builder never silently
+transposes/packs data to fit. The generic host canonical/CUDA worker is unchanged.
+
 ## Budget the resources first
 
 The examples specify 1 GiB (`1073741824`) of host CPU offload memory. Provision

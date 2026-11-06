@@ -127,7 +127,10 @@ def test_trace_invalid_destination_does_not_change_layout(helpers, monkeypatch, 
 
 def test_metadata_guard_allows_same_id_aliases_but_rejects_cross_id(helpers):
     storage = SimpleNamespace(data_ptr=lambda: 1000, nbytes=lambda: 96)
-    row = lambda offset, width: MetadataTensor(offset, (4, width), (width, 1), storage)
+
+    def row(offset, width):
+        return MetadataTensor(offset, (4, width), (width, 1), storage)
+
     layout = SimpleNamespace(
         layers=[(0, [row(32, 8), row(64, 8)]), (0, [row(0, 8), row(32, 8)])]
     )

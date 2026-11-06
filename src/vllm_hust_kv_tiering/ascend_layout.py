@@ -13,7 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.kv_offload.base import CanonicalKVCacheRef
 
 
@@ -57,10 +63,42 @@ def build_layout(config, caches):
                 raise ValueError("multiple layers in one group share an allocation")
             used.add(index)
             tensors = caches[name]
+            # A combined [2, num_blocks, ...] K/V tensor is ambiguous when
+            # num_blocks == 2: divisibility alone would silently pack whole
+            # planes rather than canonical blocks. The known non-MLA Ascend
+            # FullAttention runner supplies explicit separate K/V views.
+            if (
+                isinstance(spec, FullAttentionSpec)
+                and not isinstance(spec, MLAAttentionSpec)
+                and (not isinstance(tensors, (list, tuple)) or len(tensors) != 2)
+            ):
+                raise ValueError(
+                    "Ascend FullAttention requires separate K/V tensor views"
+                )
             if isinstance(tensors, torch.Tensor):
                 tensors = (tensors,)
-            if not tensors or not isinstance(tensors, (list, tuple)):
+            if not isinstance(tensors, (list, tuple)) or not tensors:
                 raise ValueError("missing layer cache tensors")
+            if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+                raise ValueError("layer cache views must be torch tensors")
+            if isinstance(spec, MambaSpec):
+                if len(tensors) != len(spec.shapes) or len(spec.dtypes) != len(
+                    spec.shapes
+                ):
+                    raise ValueError(
+                        "Mamba cache requires exactly the declared state views"
+                    )
+                for tensor, shape, dtype in zip(
+                    tensors, spec.shapes, spec.dtypes, strict=True
+                ):
+                    if tuple(tensor.shape) != (count, *shape):
+                        raise ValueError(
+                            "Mamba state view shape does not match its spec"
+                        )
+                    if tensor.dtype != dtype:
+                        raise ValueError(
+                            "Mamba state view dtype does not match its spec"
+                        )
             rows = []
             for tensor in tensors:
                 if tensor.ndim < 1 or tensor.shape[0] % count:
