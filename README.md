@@ -2,6 +2,13 @@
 
 Development version: `0.2.0.dev0` (pressure/lifecycle safety rework; not a qualified release).
 
+> **Real-NPU pre-PR qualification is currently blocked.** The frozen Native MTP2
+> baseline fails before plugin use, and a separate no-MTP hot-prefix diagnostic
+> also fails with an empty connector that performs no tiering operations. Do not
+> treat passing software/copy tests or CRC counters as production qualification.
+> Read the [observed failures and qualification boundaries](<docs/validation-status.md>)
+> before serving a hybrid model with this development candidate.
+
 Out-of-tree, explicitly enabled KV prefix/state-cache tiering for the frozen
 **vLLM-HUST v1** host at core
 `d0f22d2bda562156e4dbf433ce645e1769b4f804` (`d0f22d`). The matched distribution
