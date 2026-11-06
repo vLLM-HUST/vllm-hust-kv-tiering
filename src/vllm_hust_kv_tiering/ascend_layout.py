@@ -63,6 +63,8 @@ def build_layout(config, caches):
                 raise ValueError("missing layer cache tensors")
             rows = []
             for tensor in tensors:
+                if tensor.ndim < 1 or tensor.shape[0] % count:
+                    raise ValueError("Ascend cache requires a leading block axis")
                 # view, deliberately not reshape: silently allocating a copy
                 # here would disconnect restored data from the model's cache.
                 row = tensor.view(torch.int8).view(count, -1)
@@ -76,8 +78,63 @@ def build_layout(config, caches):
             layers.append((index, rows))
         groups.append(refs)
     layout = AscendLayout(pages, layers, groups)
+    _check_canonical_noninterference(layout, count)
     _trace_layout(config, caches, layout)
     return layout
+
+
+def _check_canonical_noninterference(layout, count):
+    """Host reuse fences protect IDs, not arbitrary overlapping byte ranges.
+
+    Shared SoA layers may intentionally alias the SAME canonical block ID.
+    Reject any cross-ID overlap before constructing a transfer worker. Only
+    tensor metadata is inspected; no device synchronization or byte read occurs.
+    Disjoint planes and identical shared rows take constant-time fast paths.
+    """
+    if count <= 1:
+        return
+    by_device = {}
+    for layer_index, (_, rows) in enumerate(layout.layers):
+        for row_index, row in enumerate(rows):
+            start, stride, width = row.data_ptr(), row.stride(0), row.shape[1]
+            end = start + (count - 1) * stride + width
+            for previous in by_device.setdefault(str(row.device), []):
+                (
+                    other_start,
+                    other_stride,
+                    other_width,
+                    other_end,
+                    other_layer,
+                    other_row,
+                ) = previous
+                if end <= other_start or other_end <= start:
+                    continue
+                if start == other_start and stride == other_stride:
+                    continue
+                left = right = 0
+                left_start, right_start = start, other_start
+                while left < count and right < count:
+                    left_end = left_start + width
+                    right_end = right_start + other_width
+                    if (
+                        left != right
+                        and left_start < right_end
+                        and right_start < left_end
+                    ):
+                        raise ValueError(
+                            "GPU cache views overlap across canonical block IDs "
+                            f"(layer {layer_index} row {row_index} block {left}; "
+                            f"layer {other_layer} row {other_row} block {right})"
+                        )
+                    if left_end <= right_end:
+                        left += 1
+                        left_start += stride
+                    if right_end <= left_end:
+                        right += 1
+                        right_start += other_stride
+            by_device[str(row.device)].append(
+                (start, stride, width, end, layer_index, row_index)
+            )
 
 
 def _layout_trace_payload(config, caches, layout):

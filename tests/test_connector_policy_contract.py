@@ -27,9 +27,8 @@ class Pool:
 
     def __init__(self, allocated=0.1, cached=0):
         self.allocated = allocated
-        self.cached_block_hashes_by_block = {
-            index: set() for index in range(1, cached + 1)
-        }
+        self.cached_block_hash_to_block = dict.fromkeys(range(1, cached + 1))
+        self.cached_block_hashes_by_block = {}  # supplemental aliases only
 
     def get_usage(self):
         return self.allocated
@@ -112,13 +111,13 @@ def test_actual_factory_constructs_policy_scheduler_and_reuses_manager(connector
     assert scheduler.manager._step_initialized
 
 
-def test_pressure_includes_evictable_prefix_cache_without_double_counting():
+def test_pressure_includes_cached_keys_without_adding_allocation_usage():
     pool = Pool(allocated=0.1, cached=9)
     source = HBMPressureSource(pool)
     assert source() == 0.9
     pool.allocated = 0.8
-    assert source() == 0.9  # Not 1.7: active cached blocks overlap.
-    pool.cached_block_hashes_by_block.clear()
+    assert source() == 0.9  # Max, not an additive score of 1.7.
+    pool.cached_block_hash_to_block.clear()
     assert source() == 0.8
 
 

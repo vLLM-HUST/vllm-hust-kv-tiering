@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explicit compatibility boundary for the frozen HUST CPU-primary ABI.
+"""Explicit compatibility boundary for frozen HUST pool/CPU-primary ABIs.
 
 The host exposes read/write pinning publicly, but no selective eviction method.
 Only this adapter accesses its private allocation/policy bookkeeping. Unsupported
@@ -9,19 +9,22 @@ replacement of LRU/ARC is performed.
 
 from __future__ import annotations
 
-from collections.abc import Collection
+import math
+from collections.abc import Collection, Sized
 from typing import Any
 
 from vllm.v1.kv_offload.base import OffloadingEvent, OffloadKey
 
 
 class HBMPressureSource:
-    """O(1) conservative cache pressure, including evictable prefix residency.
+    """O(1) allocated-block/cached-key pressure proxy for the frozen host.
 
-    get_usage counts allocated/non-evictable blocks, not cached free blocks.
-    The max of allocation fraction and physical cached-block fraction is a
-    lower bound on their union; never sum them and double-count active prefixes.
-    This is scheduler cache pressure, not total device memory utilization.
+    get_usage excludes evictable cached blocks. The PRIMARY lookup index counts
+    cached keys, including ordinary hashes; cached_block_hashes_by_block only
+    tracks supplemental aliases and must not be used as cache occupancy.
+    Alias keys can overcount physical blocks and duplicate blocks sharing a key
+    can undercount them. This is neither exact physical residency nor a union
+    lower bound. Take max (not sum) and clamp to [0, 1].
     """
 
     def __init__(self, pool: Any):
@@ -29,21 +32,28 @@ class HBMPressureSource:
             raise TypeError("incompatible block pool: missing get_usage()")
         if (
             not isinstance(getattr(pool, "num_gpu_blocks", None), int)
+            or isinstance(pool.num_gpu_blocks, bool)
             or pool.num_gpu_blocks < 2
         ):
             raise RuntimeError("incompatible block pool: invalid num_gpu_blocks")
-        if not isinstance(getattr(pool, "cached_block_hashes_by_block", None), dict):
-            raise TypeError(
-                "incompatible block pool: missing physical prefix-cache index"
-            )
         self.pool = pool
+        self._primary_cache_index()
+
+    def _primary_cache_index(self) -> Sized:
+        # reset_prefix_cache replaces the index object: never retain that object.
+        index = getattr(self.pool, "cached_block_hash_to_block", None)
+        if not isinstance(index, Sized):
+            raise TypeError(
+                "incompatible block pool: missing sized primary prefix-cache index"
+            )
+        return index
 
     def __call__(self) -> float:
-        allocated = self.pool.get_usage()
-        cached = len(self.pool.cached_block_hashes_by_block) / (
-            self.pool.num_gpu_blocks - 1
-        )
-        return max(allocated, cached)
+        allocated = float(self.pool.get_usage())
+        if not math.isfinite(allocated):
+            raise ValueError("incompatible block pool: get_usage() must be finite")
+        cached_keys = len(self._primary_cache_index()) / (self.pool.num_gpu_blocks - 1)
+        return min(1.0, max(0.0, allocated, cached_keys))
 
 
 class CPUPrimaryControl:

@@ -28,8 +28,8 @@ class MetadataTensor:
     def data_ptr(self):
         return self.storage.data_ptr() + self.offset
 
-    def stride(self):
-        return self.strides
+    def stride(self, dimension=None):
+        return self.strides if dimension is None else self.strides[dimension]
 
     def element_size(self):
         return 1
@@ -48,7 +48,12 @@ def helpers():
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name in {"_trace_layout", "_layout_trace_payload"}
+        and node.name
+        in {
+            "_trace_layout",
+            "_layout_trace_payload",
+            "_check_canonical_noninterference",
+        }
     ]
     namespace = {
         "json": json,
@@ -118,3 +123,26 @@ def test_trace_invalid_destination_does_not_change_layout(helpers, monkeypatch, 
         helpers["_trace_layout"](config, caches, layout)
     assert layout.layers is before
     assert "Cannot write Ascend layout trace" in caplog.text
+
+
+def test_metadata_guard_allows_same_id_aliases_but_rejects_cross_id(helpers):
+    storage = SimpleNamespace(data_ptr=lambda: 1000, nbytes=lambda: 96)
+    row = lambda offset, width: MetadataTensor(offset, (4, width), (width, 1), storage)
+    layout = SimpleNamespace(
+        layers=[(0, [row(32, 8), row(64, 8)]), (0, [row(0, 8), row(32, 8)])]
+    )
+    guard = helpers["_check_canonical_noninterference"]
+    guard(layout, 4)
+    layout.layers[1][1][1] = row(32, 16)
+    with pytest.raises(ValueError, match="across canonical block IDs"):
+        guard(layout, 4)
+
+
+def test_common_metadata_guard_fast_paths_do_not_walk_block_rows(helpers):
+    count = 10**12  # Metadata only: an accidental block scan would never finish.
+    storage = SimpleNamespace(data_ptr=lambda: 1000, nbytes=lambda: 16 * count)
+    first = MetadataTensor(0, (count, 8), (8, 1), storage)
+    disjoint = MetadataTensor(8 * count, (count, 8), (8, 1), storage)
+    shared = MetadataTensor(0, (count, 8), (8, 1), storage)
+    layout = SimpleNamespace(layers=[(0, [first, disjoint]), (0, [shared])])
+    helpers["_check_canonical_noninterference"](layout, count)

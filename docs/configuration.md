@@ -109,13 +109,20 @@ larger default low watermark.
 | `tiering_min_session_requests_for_offload` | `1` | Minimum observed request count for a tracked session. |
 | `tiering_min_reuse_probability` | `0.0` | Minimum historical session-return fraction, in `[0, 1]`. |
 
-The connector samples the matched block pool in O(1): the maximum of allocation
-pressure (`BlockPool.get_usage()`) and cached-prefix physical occupancy
-(`len(cached_block_hashes_by_block) / (num_gpu_blocks - 1)`). This is a conservative
-lower-bound composite: the two sets can overlap, so it is **not** their exact
-union, physical accelerator-memory utilization, or general HBM telemetry.
-It detects a full evictable prefix cache even at low active concurrency.
-Preemption is an additional pressure signal. Missing pressure binding is a
+The connector samples the matched block pool in O(1), taking the maximum of
+allocation pressure (`BlockPool.get_usage()`) and the **cached-key pressure proxy**
+`len(pool.cached_block_hash_to_block) / (pool.num_gpu_blocks - 1)`, clamped to
+`[0, 1]`. This is the primary lookup index, fetched anew on each sample after any
+cache reset; the frozen host implements its key count in O(1). The similarly named
+`cached_block_hashes_by_block` contains only supplemental aliases and must not
+be used to count ordinary cached prefixes.
+
+This detects ordinary evictable cached keys at low active concurrency. It is
+**not exact physical block occupancy**: alias keys may overcount physical blocks,
+while duplicate blocks sharing a key may undercount them. Consequently it is not
+an exact resident union, a guaranteed union lower bound, physical accelerator
+memory utilization, or general HBM telemetry. Preemption remains an additional
+pressure signal. Missing pressure binding/primary-index ABI support is a
 compatibility error, not a fabricated low-pressure reading.
 
 The host still controls GPU block allocation and eviction. Store admission

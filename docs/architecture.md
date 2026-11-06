@@ -29,15 +29,22 @@ Safety invariants:
 ## Placement decisions
 
 HBM admission uses the public `bind_gpu_block_pool` connector hook. Its O(1)
-pressure signal is the maximum of `BlockPool.get_usage()` (non-evictable allocation
-pressure) and the physical prefix-cache block fraction from
-`cached_block_hashes_by_block`. This includes evictable cached prefixes: using
-allocation pressure alone misses prefix-cache turnover at low active concurrency.
-Taking the maximum avoids double-counting active cached blocks and is a
-conservative lower bound on the resident union, **not total device-memory usage**.
-A high/low hysteresis gate opens at the high watermark and closes at the low
-watermark. A preemption is an additional pressure signal. Missing pressure
-binding/index support is an explicit compatibility error when pressure mode is enabled.
+pressure proxy is the maximum of `BlockPool.get_usage()` (non-evictable allocation
+pressure) and `len(pool.cached_block_hash_to_block) / (pool.num_gpu_blocks - 1)`,
+clamped to `[0, 1]`. The frozen primary lookup index has an O(1) key count and is
+fetched again on every sample because cache reset replaces the index object.
+`cached_block_hashes_by_block` contains only supplemental aliases: ordinary cached
+prefixes need not appear there, so using it would incorrectly report idle cache
+pressure as zero.
+
+The primary index includes ordinary evictable prefixes, but its length counts
+**cached keys**, not physical blocks. Alias keys can overcount physical occupancy;
+duplicate physical blocks sharing a key can undercount it. This is not an exact
+resident union, a guaranteed union lower bound, or total device-memory usage.
+Taking the maximum avoids adding two overlapping proxies. A high/low hysteresis
+gate opens at the high watermark and closes at the low watermark. Preemption is
+an additional pressure signal. Missing binding/primary-index ABI support is an
+explicit compatibility error, not a fabricated low-pressure sample.
 
 The plugin scheduler subclasses the host scheduler only at its store-admission
 hook. When the gate is closed it postpones host store-job construction, preserving
