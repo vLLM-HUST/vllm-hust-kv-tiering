@@ -96,6 +96,12 @@ host's worker; omitting it on an NPU host does not select the Ascend adapter.
 Unsupported cache layouts fail explicitly rather than silently copying a
 guessed layout.
 
+**Hybrid/Mamba prerequisite:** the explicit Ascend-copy profile fails fast on
+legacy core hosts that lack the separate unified-HMA prefix-hit repair API.
+See [Ascend hybrid host safety prerequisites](<docs/ascend-hybrid-host-safety.md>)
+for the exact guard boundary and the independent, still-unqualified MTP path.
+Recognizing the API is not general host or model qualification.
+
 Requesting `copy_(..., non_blocking=True)` for mmap-backed CPU memory does not
 prove asynchronous overlap. No host-pinning heuristic is applied. Copy, event
 record/query/wait errors stop normal worker operation; failed fences raise and

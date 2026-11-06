@@ -9,6 +9,7 @@ from dataclasses import replace
 
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
+from vllm_hust_kv_tiering.host_compat import require_safe_ascend_hybrid_prefix_host
 from vllm_hust_kv_tiering.lifecycle import LifecycleConfig, SessionLifecycleManager
 from vllm_hust_kv_tiering.lifecycle_manager import LifecycleAwareManager
 from vllm_hust_kv_tiering.policy import TieringPolicyConfig, boolean, positive_int
@@ -72,6 +73,7 @@ class HustTieringOffloadingSpec(TieringOffloadingSpec):
             positive_int(extra, "block_size", 0)
         if extra.get("eviction_policy", "lru") not in ("lru", "arc"):
             raise ValueError("eviction_policy must be lru or arc")
+        require_safe_ascend_hybrid_prefix_host(extra, kv_cache_config)
         self._register_storage()
         super().__init__(vllm_config, kv_cache_config)
         if self.num_blocks < 1:
