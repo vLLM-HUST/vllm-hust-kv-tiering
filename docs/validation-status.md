@@ -1,97 +1,110 @@
-# NPU qualification status: pre-PR gates are not green
+# Scoped NPU validation and remaining boundaries
 
-`0.2.0.dev0` is a development candidate, not a production-qualified release.
-Software tests and byte-copy tests do not establish full-model cache correctness.
+`0.2.0.dev0` remains a development version, not a universal production certificate.
+The original frozen SDK failures below were not waived; explicit, version-bound
+repairs were tested in isolated source checkouts. No source or metadata was
+silently replaced by installing/importing the plugin.
 
-## Runtime actually exercised
+## Reference runtime
 
-- vLLM-HUST source: `d0f22d2bda562156e4dbf433ce645e1769b4f804`.
-- vLLM-Ascend-HUST source: `9bf964cb4b87c8cd0d6852c41a55b3c29711fa95`.
-- Installed vLLM distribution: `0.25.1+frontier.bidkv`; torch `2.10.0+cpu`,
-  torch-npu `2.10.0.post4`, CANN 9.1.0.
-- Two real Ascend 910B2 devices, BF16 TP2, Qwen3.5-35B-A3B.
-- The existing Ascend version-routing override `VLLM_VERSION=0.25.1` was used;
-  it does not change the installed distribution metadata. Inherited CANN Python
-  and library paths must be preserved, not replaced.
+- Original vLLM-HUST base: `d0f22d2bda562156e4dbf433ce645e1769b4f804`;
+  repaired reference: `3bf4ba0b0ee547577b4e6bb772ccd45aa5793670`.
+- Original Ascend base: `9bf964cb4b87c8cd0d6852c41a55b3c29711fa95`;
+  repaired reference: `b8ff9a5f0ae8f60980d895651f37dcd3808ce8d9`.
+- Installed vLLM distribution `0.25.1+frontier.bidkv`; torch `2.10.0+cpu`,
+  torch-npu `2.10.0.post4`, CANN 9.1, two real 910B2 devices, BF16 TP2,
+  Qwen3.5-35B-A3B.
+- Reference model gates configure context 262144, KV 26,038,239,232 bytes per
+  card, APC, async scheduling, MTP2, and `FULL_AND_PIECEWISE`. Normal decode FULL
+  remains enabled; graph eligibility is corrected for actual prefill, not
+  globally disabled with an eager flag.
+- The host's existing `VLLM_VERSION=0.25.1` implementation routing was preserved;
+  installed distribution metadata and CANN paths were not spoofed.
 
-The packaged ECPA discovery manifest still has the historical exact `.empty`
-distribution constraint. Direct connector activation, discovery, package import,
-and a successful ECPA install/enable lifecycle are different claims; do not
-interpret these tests as qualification of that lifecycle or distribution.
+The [exact-base manifest](<../runtime-patches/manifest.json>) and
+[explicit installation notes](<../runtime-patches/README.md>) pin the repairs.
+The ECPA discovery capsule retains its historical `.empty` constraint; direct
+connector activation and a complete ECPA install/enable lifecycle are different
+claims. That distribution/lifecycle is not separately hardware-qualified here.
 
-## Blocking full-model observations
+## What passed on the repaired pair
 
-### Native MTP2 baseline fails independently of this plugin
+- **295 installed-payload SDK tests**, zero failures/errors/skips, with import
+  origins and all 18 Python/JSON payload files checked against the source.
+- **Native, CPU-only tier, and CPU+FS each pass 80 strict model responses**.
+  These include fresh/cached C1 and C8 replay, independent prompt salts, prompt
+  lengths8190/8191/8192/8193 around the8192 boundary, and an earlier6217-token
+  retrieval fixture. Golden strings, prompt bytes, output caps and actual usage
+  checks were not changed to accept failures.
+- The FS diagnostic also witnesses **8,325,808,128 reported FS-read bytes** and
+  **472,940,544 reported H2D bytes**, with the strict80-response gate passing.
+  Positive-device-copy cases are the C8 reset/fresh passes; a tentative FS→CPU
+  promotion alone is not called a GPU recovery. Observed FS load/checksum errors
+  are zero. This does not measure physical SSD cache misses or copy/compute overlap.
+- Exact-source CPU contract tests cover feedback producer identity across both
+  scheduling modes and batch replacement/reordering. Separate real-NPU probes
+  cover transfer fences, typed SoA views, cross-group guards, V1 copies at
+  representative40KiB conv/1MiB temporal sizes, and short-prefill convolution.
+  These are component checks, not independent general answer-quality cases.
 
-With the intended 256K context, 26,038,239,232 KV bytes per card, APC, asynchronous
-scheduling, MTP2 and FULL_AND_PIECEWISE graphs, the Native server reached readiness
-but its first inference failed in fused Mamba postprocessing. The frozen core and
-Ascend replacement have incompatible call signatures, producing:
+The CPU/FS model gate uses a diagnostic2GiB CPU tier, forced admission and a fresh
+FS namespace. It is not a same-settings performance run. A configured256K context
+is not proof of semantic correctness at256K input length; these named retrieval
+fixtures stop at8193 input tokens and use short deterministic answers.
 
-```text
-TypeError: dynamic_func() got multiple values for argument 'block_size'
-```
+## Historical failures and causal fixes
 
-This occurred without the tiering connector. Dropping an argument, pretending to
-be different hardware, or disabling MTP2 is not qualification of that baseline.
-No host source or kernel was patched to manufacture a passing result.
+1. **Connector-present hybrid hits:** the legacy scheduler/Ascend coordinator
+   could retain attention hits while omitting Mamba checkpoint IDs, even for a
+   no-op connector. The core now requires explicit request-scoped opt-in for
+   nonuniform hybrid local hits. This plugin stays on safe unified local hits;
+   old hosts are rejected before allocating transfer storage.
+2. **Native MTP postprocess ABI:** the original pair failed before tiering use
+   with `dynamic_func() got multiple values for argument 'block_size'`. The V1
+   ABI/state metadata was ported explicitly, not repaired by dropping an argument.
+3. **Feedback buffer and ownership:** adapting to the core's private accepted
+   feedback buffer initially fixed continued decode but exposed a whole-new-batch
+   ownership error. A new cached request could inherit acceptance3, shifting its
+   conv copy by two rows and choosing an uninitialized SSM block. Actual byte
+   traces showed unchanged checkpoints but wrong restore arguments. The final
+   repair binds feedback to the exact producer's request identities and defaults
+   new requests to1 before preparing copies.
+4. **One-token prefill graph eligibility:** actual state traces showed prefill
+   writes following prior decode addresses. The runtime now distinguishes
+   `computed < prompt` from true decode, preserving FULL decode and eligible
+   PIECEWISE prefill rather than globally disabling graphs.
+5. **MTP external-match starvation:** the generic EAGLE/MTP fallback treated
+   recurrent groups as volatile draft-attention tails. That demanded two
+   consecutive checkpoints and omitted a sole current checkpoint from storage.
+   FS reads could complete without any accepted device restore. The repaired
+   core excludes recurrent groups from that fallback while preserving attention
+   annotations and rejecting unsupported explicit recurrent draft annotations.
 
-### Connector-present hot-prefix correctness remains unresolved without MTP
+These failures remain part of the record. Passing lower-level tests, a capability
+marker, CRC or HTTP status alone did not establish these fixes; unchanged model
+and device-transfer gates were required.
 
-In a separate no-MTP diagnostic, C1 retrieval and cold inference can pass while
-later C8 hot-prefix reuse produces instruction echoes, repetitive fragments,
-whitespace or gibberish. CPU-only and filesystem-backed runs showed the symptom.
-A refused-admission control with zero transfer history also reproduced it.
+## Operational and interpretation limits
 
-Crucially, a separate empty connector implementing only the host interfaces,
-without importing the tiering implementation or creating cache views, mmap,
-streams, managers or transfers, also reproduced the severe hot-pass symptom.
-This demonstrates that tiering copies and its internal scheduler/manager are not
-necessary to trigger that failure. It narrows the implicated integration path;
-it does **not** identify a particular host kernel or prove every plugin behavior
-correct.
+- Performance must pin the actual SDK/source pair and serving parameters. Report
+  NoMTP separately from MTP2. Do not use earlier NoMTP numbers as the final MTP2
+  result or present a changed runtime as the original frozen pair.
+- The private5000-row dataset has no semantic answer gold. Output caps are kept
+  per row; first64/256 subsets are not a full5000 evaluation. Exact-parity common
+  subsets must retain their full measured-pass wall costs and disclose selection
+  bias, unverified outputs, tail latency and actual I/O before claiming benefit.
+- CRC verifies bytes, not prefix meaning. TTL deletion concerns historical
+  metadata/files, not active-HBM eviction, zeroization or secure erasure. CPU
+  reclamation releases logical slots; it does not promise mmap RSS unmapping.
+- Lifecycle CRC-fallback, activity-driven idle reclaim and TTL deletion were
+  separately exercised on the earlier NoMTP maintenance profile. They are not
+  automatically reclassified as MTP2 or long-soak production qualification.
+- Provision CPU mmap capacity plus IPC headroom in `/dev/shm`. Stop owned API
+  leaders gracefully before an owned process-group backstop. Never reclaim
+  shared-memory files without verifying exact ownership and open mappings.
+- Arbitrary models/SDK commits, unexercised context lengths, nonstandard state
+  layouts or short/variable speculative query variants require separate
+  qualification. Source-level latent constraints are not waived by these tests.
 
-Switching to NHD or disabling asynchronous scheduling did not remove the observed
-failure. An eager/NONE-graph empty-connector run removed the observed severe
-second-wave loops in that run, but retained an instruction echo and failed strict
-warm/reference comparisons. Execution timing and batching also changed. This is
-not an accepted fix, a supported workaround, or proof of a graph-specific cause.
-
-CRC32 validates stored bytes, not the meaning of a prefix key, layout, GDN state,
-or subsequent HBM cache reuse. Zero checksum errors cannot waive this gate.
-
-## What lower-level tests do and do not show
-
-Real-device tests exercise both visible NPU devices, typed hybrid SoA views,
-partial pages, stream/event ownership and cross-group noninterference. Separate
-byte probes exercise D2H/H2D and query-only D2H completion before any explicit
-fence. Native versus nonzero-offset aligned Mamba-copy microcases also check full
-bytes and guards. These are valuable component checks, not substitutes for the
-blocked full-model path or evidence of compute/copy overlap.
-
-During validation, the pressure adapter was corrected to read the primary prefix
-lookup index rather than its supplemental-alias table. Its O(1) cached-key signal
-is a pressure proxy, not exact physical residency: aliases can overcount blocks,
-and duplicate physical blocks under one key can undercount them. Layout checks
-also reject cross-canonical-ID overlaps and unsupported ambiguous cache views.
-Those fixes must not be described as fixing the independent hot-prefix failure.
-
-## Operational and release boundaries
-
-- Do not deploy this frozen pair for production hybrid-prefix offloading on the
-  strength of passing unit tests, C1 examples or transfer/integrity counters.
-- Require a compatible base runtime and full-model correctness requalification
-  before accepting performance or production-readiness claims.
-- Small synthetic retrieval fixtures and capped/truncated Pujiang diagnostics are
-  not official benchmark or general task-quality certification. No official
-  large-scale quality/performance acceptance follows from them.
-- Provision CPU mmap capacity **plus IPC headroom** in `/dev/shm`. Use an owned
-  graceful API shutdown (for example `--shutdown-timeout 60`) before a forced
-  process-group backstop. Abnormal termination may leave named mmap resources;
-  verify exact ownership and absence of open mappings before reclaiming them.
-- TTL deletion concerns plugin-managed historical CPU/FS metadata. It is not
-  active attention oversubscription, HBM zeroization or physical secure erasure.
-
-**Current decision: pre-PR production/correctness qualification is not complete;
-these blocking observations must remain visible, not converted into a green
-result by changing references or silently weakening the serving configuration.**
+The supported conclusion is scoped functional/reference-path validation, not a
+blanket claim that all model behavior or production failure modes are certified.

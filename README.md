@@ -1,18 +1,23 @@
 # vllm-hust-kv-tiering
 
-Development version: `0.2.0.dev0` (pressure/lifecycle safety rework; not a qualified release).
+Development version: `0.2.0.dev0` (scoped hardware validation; not production certification).
 
-> **Real-NPU pre-PR qualification is currently blocked.** The frozen Native MTP2
-> baseline fails before plugin use, and a separate no-MTP hot-prefix diagnostic
-> also fails with an empty connector that performs no tiering operations. Do not
-> treat passing software/copy tests or CRC counters as production qualification.
-> Read the [observed failures and qualification boundaries](<docs/validation-status.md>)
-> before serving a hybrid model with this development candidate.
+> **The reference Ascend hybrid profile requires explicitly repaired SDKs.**
+> On the documented pair, the installed-payload suite passes 295 tests and
+> Native/CPU/FS each pass 80 strict MTP2 retrieval responses, including cached
+> 8192-boundary reuse. Completed FS reads and device restoration were also
+> witnessed together with unchanged golden responses. This is not arbitrary
+> host/model, full-context, general answer-quality, or production certification.
+> Read the [validation scope and historical failures](<docs/validation-status.md>)
+> and [explicit SDK prerequisites](<runtime-patches/README.md>) before deployment.
 
 Out-of-tree, explicitly enabled KV prefix/state-cache tiering for the frozen
 **vLLM-HUST v1** host at core
 `d0f22d2bda562156e4dbf433ce645e1769b4f804` (`d0f22d`). The matched distribution
-line used for CPU integration validation is `0.25.1+frontier.bidkv`.
+line used for CPU integration validation is `0.25.1+frontier.bidkv`. The repaired
+reference uses core `3bf4ba0b0ee547577b4e6bb772ccd45aa5793670` and Ascend
+`b8ff9a5f0ae8f60980d895651f37dcd3808ce8d9`; the exact-base patches are
+[shipped separately](<runtime-patches/manifest.json>) and are never auto-applied.
 The historical `.empty` capsule string remains in the ECPA discovery manifest;
 that distribution is not separately hardware-qualified here. This is **not** a
 compatibility claim for upstream vLLM or `0.28.x`.
@@ -99,7 +104,8 @@ guessed layout.
 **Hybrid/Mamba prerequisite:** the explicit Ascend-copy profile fails fast on
 legacy core hosts that lack the separate unified-HMA prefix-hit repair API.
 See [Ascend hybrid host safety prerequisites](<docs/ascend-hybrid-host-safety.md>)
-for the exact guard boundary and the independent, still-unqualified MTP path.
+for the exact guard boundary and the additional graph, MTP feedback/ABI, and
+recurrent-checkpoint matching contracts.
 Recognizing the API is not general host or model qualification.
 
 Requesting `copy_(..., non_blocking=True)` for mmap-backed CPU memory does not
