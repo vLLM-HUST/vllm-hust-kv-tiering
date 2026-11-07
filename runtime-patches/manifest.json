@@ -1,0 +1,24 @@
+[
+  {
+    "patch": "vllm-core-mtp-offload-safe.patch",
+    "base_commit": "d0f22d2bda562156e4dbf433ce645e1769b4f804",
+    "repaired_commit": "3bf4ba0b0ee547577b4e6bb772ccd45aa5793670",
+    "sha256": "cfe7174c829dd1df32b999a77cc229eb227f45b13e4d498f1b0eba4fde8362d2",
+    "bytes": 4419,
+    "forward_and_reverse_apply_check": true,
+    "applied_to_pristine": false,
+    "source_clean": true,
+    "scope": "Explicit Python SDK patch; no host import monkeypatch, metadata spoof, C++/CANN rebuild"
+  },
+  {
+    "patch": "vllm-ascend-mamba-v1-safe.patch",
+    "base_commit": "9bf964cb4b87c8cd0d6852c41a55b3c29711fa95",
+    "repaired_commit": "b8ff9a5f0ae8f60980d895651f37dcd3808ce8d9",
+    "sha256": "fa8057e315820f837e9b9950d10dbc697d61f6b5f57aa78aba8c9bad3882d079",
+    "bytes": 23206,
+    "forward_and_reverse_apply_check": true,
+    "applied_to_pristine": false,
+    "source_clean": true,
+    "scope": "Explicit Python SDK patch; no host import monkeypatch, metadata spoof, C++/CANN rebuild"
+  }
+]

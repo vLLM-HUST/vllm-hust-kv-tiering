@@ -1,0 +1,100 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index 954fedafe8..9120713679 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -121,6 +121,19 @@ def supports_hma(connector: Any) -> bool:
+         return isinstance(connector, SupportsHMA)
+ 
+ 
++class SupportsNonuniformHybridLocalHits(ABC):
++    """Explicit, request-scoped permission to omit local recurrent-state hits.
++
++    HMA support alone does not provide this guarantee. Default is fail-closed.
++    Opt in only when a validated transfer plan restores every omitted state
++    before model execution, even when external token delta would be zero.
++    Ordinary local requests and rejected/absent transfer plans must return False.
++    """
++
++    def can_use_nonuniform_hybrid_local_hits(self, request: "Request") -> bool:
++        return False
++
++
+ class KVConnectorRole(enum.Enum):
+     # Connector running in the scheduler process
+     SCHEDULER = 0
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 284098ce94..e31c950737 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
+     KVCacheSpec,
+     MambaSpec,
+     SlidingWindowSpec,
++    UniformTypeKVCacheSpecs,
+ )
+ from vllm.v1.kv_offload.base import (
+     GPULoadStoreSpec,
+@@ -92,6 +93,17 @@ class GroupOffloadConfig(NamedTuple):
+     is_eagle_group: bool = False
+ 
+ 
++def _contains_mamba_spec(kv_spec: KVCacheSpec) -> bool:
++    if isinstance(kv_spec, MambaSpec):
++        return True
++    if isinstance(kv_spec, UniformTypeKVCacheSpecs):
++        return any(
++            _contains_mamba_spec(child)
++            for child in kv_spec.kv_cache_specs.values()
++        )
++    return False
++
++
+ def get_sliding_window_size_in_blocks(
+     kv_cache_spec: KVCacheSpec, offloaded_block_size: int
+ ) -> int | None:
+@@ -178,8 +190,18 @@ class SchedulerOffloadConfig(NamedTuple):
+             spec.vllm_config.speculative_config is not None
+             and spec.vllm_config.speculative_config.use_eagle()
+         )
++        # Draft-attention volatility is not a recurrent checkpoint window.
++        # Reject an explicit unsupported recurrent annotation; never erase it.
++        mamba_groups = {
++            idx for idx, group in enumerate(spec.kv_cache_config.kv_cache_groups)
++            if _contains_mamba_spec(group.kv_cache_spec)
++        }
++        if eagle_groups & mamba_groups:
++            raise ValueError("EAGLE/MTP draft-tail annotation on Mamba is unsupported")
+         if use_eagle and not eagle_groups:
+-            eagle_groups = set(range(len(spec.kv_cache_config.kv_cache_groups)))
++            eagle_groups = (
++                set(range(len(spec.kv_cache_config.kv_cache_groups))) - mamba_groups
++            )
+ 
+         if eagle_groups:
+             logger.info(
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 1488be426f..f0278a9a04 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -21,7 +21,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
+     KVConnectorRole,
+     SupportsHMA,
+ )
+-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
++from vllm.distributed.kv_transfer.kv_connector.v1.base import (
++    KVConnectorMetadata,
++    SupportsNonuniformHybridLocalHits,
++)
+ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+@@ -711,7 +714,8 @@ class Scheduler(SchedulerInterface):
+                 if request.num_computed_tokens == 0:
+                     # Get locally-cached tokens.
+                     if (
+-                        self.connector is not None
++                        isinstance(self.connector, SupportsNonuniformHybridLocalHits)
++                        and self.connector.can_use_nonuniform_hybrid_local_hits(request)
+                         and self.has_mamba_layers
+                         and isinstance(
+                             self.kv_cache_manager.coordinator,
