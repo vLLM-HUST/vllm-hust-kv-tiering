@@ -149,7 +149,7 @@ python -m pytest -q tests/test_connector_policy_contract.py \
 
 ```bash
 VLLM_KV_TIERING_RUN_NPU_TESTS=1 python -m pytest -q -m npu \
-  tests/test_ascend_worker.py tests/test_ascend_layout.py
+  tests/test_ascend_layout.py
 ```
 
 整模型三层检查使用 `examples/pressure-tiering.json`，把 `root_dir` 改为本次运行

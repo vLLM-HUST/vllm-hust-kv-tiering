@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
-"""Actual-host FS manager contract tests (skip without the frozen vLLM host)."""
+"""Matched-host filesystem factory, I/O, integrity and resource contracts."""
 
 from __future__ import annotations
 
@@ -9,8 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-pytestmark = pytest.mark.host
 
 pytest.importorskip("vllm.v1.kv_offload.tiering.base")
 np = pytest.importorskip("numpy")
@@ -23,6 +20,8 @@ from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 
 from vllm_hust_kv_tiering.fs import manager as fs_manager
 from vllm_hust_kv_tiering.spec import HustTieringOffloadingSpec
+
+pytestmark = pytest.mark.host
 
 
 class HeldPool:
@@ -388,3 +387,24 @@ def test_fs_metrics_report_actual_io_once_without_resetting_snapshots(make_tier)
     assert finish(tier)[0].success
     assert tier.get_storage_counters()["load_bytes"] == 4096
     assert tier.get_stats().reduce()[prefix + "load_bytes:('hust_fs',)"] == 4096
+
+
+def test_actual_host_factory_segment_store_restore(make_tier):
+    tier, raw = make_tier(
+        backend="torch_sync",
+        held=False,
+        n_read_threads=1,
+        n_write_threads=1,
+        storage_layout="segment",
+    )
+    key = make_offload_key(bytes(range(32)), 0)
+    request = SimpleNamespace(req_id="fixture")
+    tier.submit_store(JobMetadata(1, [key], np.array([1]), False, request))
+    result = finish(tier)
+    assert len(result) == 1 and result[0].success
+    expected = bytes(raw[4096:8192])
+    raw[12288:16384] = bytes(4096)
+    tier.submit_load(JobMetadata(2, [key], np.array([3]), True, request))
+    result = finish(tier)
+    assert len(result) == 1 and result[0].success
+    assert bytes(raw[12288:16384]) == expected

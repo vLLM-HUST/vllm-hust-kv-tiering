@@ -102,12 +102,24 @@ python -m pip install -e '.[dev]'
 python -m pytest -q tests -m 'not host and not npu'
 ```
 
+The suite is grouped by component rather than by the change that introduced a
+regression:
+
+- Portable: policy/working-set admission, lifecycle/residency, manager admission
+  contracts, asynchronous worker safety, segment storage, and host/layout guards.
+- Matched host: tiering manager lifecycle and cache-policy invariants,
+  filesystem factory/I/O, connector/scheduler pressure, and Ascend layout/copies.
+
+Shared setup lives with its component's tests. Host-only modules skip before
+importing optional dependencies; device round trips retain the separate NPU
+marker and explicit activation guard.
+
 Matched-host tests require the pinned host and its real dependencies. NPU tests
 additionally require an isolated device and explicit activation:
 
 ```bash
 VLLM_KV_TIERING_RUN_NPU_TESTS=1 python -m pytest -q -m npu \
-  tests/test_ascend_worker.py tests/test_ascend_layout.py
+  tests/test_ascend_layout.py
 ```
 
 Passing portable or CPU/FS contract tests does not establish full-model hybrid

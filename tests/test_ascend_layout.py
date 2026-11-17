@@ -1,3 +1,5 @@
+"""Matched-host Ascend layout and copy plans, with opt-in real-NPU round trips."""
+
 import os
 import uuid
 
@@ -5,7 +7,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm.v1.kv_cache_interface")
-pytestmark = pytest.mark.host
+pytest.importorskip("vllm.v1.kv_offload.base")
 
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -15,12 +17,23 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
 )
-from vllm.v1.kv_offload.base import GPULoadStoreSpec
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCacheRef,
+    CanonicalKVCaches,
+    CanonicalKVCacheTensor,
+    GPULoadStoreSpec,
+)
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 from vllm_hust_kv_tiering.ascend_layout import build_layout
-from vllm_hust_kv_tiering.ascend_worker import AscendLayoutWorker
+from vllm_hust_kv_tiering.ascend_worker import (
+    AscendCopyWorker,
+    AscendLayoutWorker,
+    copy_plan,
+)
+
+pytestmark = pytest.mark.host
 
 
 def fixture(device="cpu", typed=False):
@@ -251,5 +264,67 @@ def test_real_npu_soa_hybrid_store_restore_and_transaction_validation(
                 10, CPULoadStoreSpec([0]), GPULoadStoreSpec([1, 99], [2, 0], [0, 0])
             )
         assert torch.equal(raw.cpu(), before)
+    finally:
+        worker.shutdown()
+
+
+def test_group_alignment_and_padding():
+    refs = [[CanonicalKVCacheRef(0, 5)], [CanonicalKVCacheRef(1, 3)]]
+    gpu = GPULoadStoreSpec([7, 8, 9], [2, 1], [1, 3])
+    cpu = CPULoadStoreSpec([4, 5, 6])
+    assert copy_plan(gpu, cpu, refs, 2) == [
+        (0, 7, 4, 1, 5),
+        (0, 8, 5, 0, 5),
+        (1, 9, 6, 1, 3),
+    ]
+    with pytest.raises(ValueError, match="shorter"):
+        copy_plan(gpu, CPULoadStoreSpec([4]), refs, 2)
+
+
+@pytest.mark.npu
+@pytest.mark.skipif(
+    os.environ.get("VLLM_KV_TIERING_RUN_NPU_TESTS") != "1"
+    or not hasattr(torch, "npu")
+    or not torch.npu.is_available(),
+    reason="requires VLLM_KV_TIERING_RUN_NPU_TESTS=1 and an available real Ascend NPU",
+)
+@pytest.mark.parametrize("device_index", [0, 1])
+def test_real_npu_hybrid_partial_page_round_trip(tmp_path, device_index):
+    if device_index >= torch.npu.device_count():
+        pytest.skip("requested NPU is not visible")
+    torch.npu.set_device(device_index)
+    tensors = [
+        torch.arange(64, dtype=torch.int8).view(4, 16).npu(),
+        (torch.arange(64, dtype=torch.int8) + 40).view(4, 16).npu(),
+    ]
+    expected = [tensor.cpu() for tensor in tensors]
+    caches = CanonicalKVCaches(
+        tensors=[CanonicalKVCacheTensor(t, 16) for t in tensors],
+        group_data_refs=[[CanonicalKVCacheRef(0, 11)], [CanonicalKVCacheRef(1, 7)]],
+    )
+    region = SharedOffloadRegion(
+        instance_id=uuid.uuid4().hex,
+        num_blocks=4,
+        rank=0,
+        kv_bytes_per_block=4096,
+        cpu_page_size=64,
+    )
+    worker = AscendCopyWorker(caches, 2, 4, region)
+    gpu = GPULoadStoreSpec([1, 2, 3], [2, 1], [1, 3])
+    cpu = CPULoadStoreSpec([0, 1, 2])
+    try:
+        assert worker.submit_store(1, gpu, cpu)
+        worker.wait({1})
+        assert worker.get_finished()[0].transfer_size == 29
+        tensors[0][1:3].zero_()
+        tensors[1][3].zero_()
+        assert worker.submit_load(2, cpu, gpu)
+        worker.wait({2})
+        assert worker.get_finished()[0].transfer_size == 29
+        assert torch.equal(tensors[0][1:3, :11].cpu(), expected[0][1:3, :11])
+        assert torch.equal(tensors[1][3, :7].cpu(), expected[1][3, :7])
+        assert torch.count_nonzero(tensors[0][1:3, 11:]).item() == 0
+        assert torch.count_nonzero(tensors[1][3, 7:]).item() == 0
+        assert worker.get_finished() == []
     finally:
         worker.shutdown()
