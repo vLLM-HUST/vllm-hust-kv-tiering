@@ -1,9 +1,9 @@
 # Serving validation status and acceptance protocol
 
-The current policy/lifecycle implementation is **not hardware-qualified**. No
-throughput, TTFT, TPOT or overlap result from an earlier commit establishes the
-behavior of this implementation. `MOD_METADATA.json` remains experimental and
-unqualified. Passing software tests is not a serving-performance claim.
+Qualification requires the exact current plugin source and matched host. Run
+software, device and full-model checks separately; keep generated results and
+logs outside this repository. [The reproduction guide](reproduction.zh-CN.md)
+provides a concrete two-tier SWE replay configuration and three-tier checks.
 
 ## Three separate questions
 
@@ -28,7 +28,7 @@ Use the active `vllm-hust-benchmark` acceptance contract and the authorized
 Pujiang datasets. Preserve their original input/response protocol, identities,
 order and hashes; do not silently flatten multi-turn messages, invent prompts,
 truncate contexts or replace specified data with a convenient synthetic trace.
-The small generated workload in `benchmarks/` is a diagnostic fixture only.
+Synthetic pressure inputs are supplementary diagnostics only.
 
 Record immutable identities for:
 

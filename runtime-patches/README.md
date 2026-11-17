@@ -13,8 +13,8 @@ plugin**. Never apply them to an unrelated running checkout.
   local hits and recurrent-checkpoint-safe MTP offload eligibility.
 - [Ascend patch](<vllm-ascend-mamba-v1-safe.patch>): V1 postprocess ABI, feedback
   buffer and producer-identity ownership, and prefill/decode graph eligibility.
-- [Manifest](<manifest.json>): exact SHA256, bases, repaired commits, and checked
-  forward/reverse application. The pristine verification clones were not modified.
+- [Manifest](<manifest.json>): exact SHA256, bases, repaired commits and patch sizes.
+  Verify application against your isolated source checkout before deployment.
 
 ## Apply explicitly in isolated SDK worktrees
 

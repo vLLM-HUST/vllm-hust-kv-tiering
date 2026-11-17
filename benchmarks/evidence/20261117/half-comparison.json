@@ -1,7 +1,0 @@
-{
-  "output_tok_s_change_pct": 15.028872441793562,
-  "ttft_mean_s_change_pct": -5.819572695034347,
-  "ttft_p95_s_change_pct": -11.118118592902382,
-  "tpot_mean_s_change_pct": -0.17121117338789738,
-  "prefill_saved_tokens": 1105920.0
-}
