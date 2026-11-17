@@ -4,15 +4,16 @@
 
 from __future__ import annotations
 
-import math
 import time
-from collections.abc import Collection, Iterable
+from collections import OrderedDict
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 
+from vllm_hust_kv_tiering.policy import boolean, finite, positive_int
 from vllm_hust_kv_tiering.residency import BlockResidencyTracker
 
 
@@ -62,20 +63,36 @@ class LifecycleConfig:
             ("lifecycle_idle_ttl_sec", self.idle_ttl_sec),
             ("lifecycle_cpu_demote_after_sec", self.cpu_demote_after_sec),
         ):
-            if not math.isfinite(value) or value < 0:
+            finite({name: value}, name, 0.0)
+            if value < 0:
                 raise ValueError(f"{name} must be a finite non-negative number")
+        for name, value in (
+            ("lifecycle_cpu_low_watermark", self.cpu_low_watermark),
+            ("lifecycle_cpu_high_watermark", self.cpu_high_watermark),
+        ):
+            finite({name: value}, name, 1.0)
+        boolean(
+            {"lifecycle_delete_expired_secondary": self.delete_expired_secondary},
+            "lifecycle_delete_expired_secondary",
+            False,
+        )
+        boolean(
+            {"residency_tracking_enabled": self.residency_tracking_enabled},
+            "residency_tracking_enabled",
+            False,
+        )
         if not 0 < self.cpu_low_watermark <= self.cpu_high_watermark <= 1:
             raise ValueError(
                 "lifecycle_cpu_low_watermark and "
                 "lifecycle_cpu_high_watermark must satisfy "
                 "0 < low <= high <= 1"
             )
-        if self.reclaim_batch_size <= 0:
-            raise ValueError("lifecycle_reclaim_batch_size must be greater than zero")
-        if self.residency_max_entries <= 0:
-            raise ValueError("residency_max_entries must be greater than zero")
-        if self.max_sessions <= 0:
-            raise ValueError("lifecycle_max_sessions must be greater than zero")
+        for name, value in (
+            ("lifecycle_reclaim_batch_size", self.reclaim_batch_size),
+            ("residency_max_entries", self.residency_max_entries),
+            ("lifecycle_max_sessions", self.max_sessions),
+        ):
+            positive_int({name: value}, name, 1)
 
     @property
     def enabled(self) -> bool:
@@ -88,29 +105,47 @@ class LifecycleConfig:
 
     @classmethod
     def from_extra_config(cls, extra_config: dict[str, Any]) -> LifecycleConfig:
+        known = {
+            "lifecycle_idle_ttl_sec",
+            "lifecycle_delete_expired_secondary",
+            "lifecycle_cpu_demote_after_sec",
+            "lifecycle_cpu_high_watermark",
+            "lifecycle_cpu_low_watermark",
+            "lifecycle_reclaim_batch_size",
+            "residency_max_entries",
+            "lifecycle_max_sessions",
+            "residency_tracking_enabled",
+        }
+        unknown = sorted(
+            key
+            for key in extra_config
+            if key.startswith(("lifecycle_", "residency_")) and key not in known
+        )
+        if unknown:
+            raise ValueError(
+                f"unsupported lifecycle/residency option(s): {', '.join(unknown)}"
+            )
         return cls(
-            idle_ttl_sec=float(extra_config.get("lifecycle_idle_ttl_sec", 0.0)),
-            delete_expired_secondary=bool(
-                extra_config.get("lifecycle_delete_expired_secondary", False)
+            idle_ttl_sec=finite(extra_config, "lifecycle_idle_ttl_sec", 0.0),
+            delete_expired_secondary=boolean(
+                extra_config, "lifecycle_delete_expired_secondary", False
             ),
-            cpu_demote_after_sec=float(
-                extra_config.get("lifecycle_cpu_demote_after_sec", 0.0)
+            cpu_demote_after_sec=finite(
+                extra_config, "lifecycle_cpu_demote_after_sec", 0.0
             ),
-            cpu_high_watermark=float(
-                extra_config.get("lifecycle_cpu_high_watermark", 0.9)
+            cpu_high_watermark=finite(
+                extra_config, "lifecycle_cpu_high_watermark", 1.0
             ),
-            cpu_low_watermark=float(
-                extra_config.get("lifecycle_cpu_low_watermark", 0.7)
+            cpu_low_watermark=finite(extra_config, "lifecycle_cpu_low_watermark", 1.0),
+            reclaim_batch_size=positive_int(
+                extra_config, "lifecycle_reclaim_batch_size", 64
             ),
-            reclaim_batch_size=int(
-                extra_config.get("lifecycle_reclaim_batch_size", 64)
+            residency_max_entries=positive_int(
+                extra_config, "residency_max_entries", 64_000
             ),
-            residency_max_entries=int(
-                extra_config.get("residency_max_entries", 64_000)
-            ),
-            max_sessions=int(extra_config.get("lifecycle_max_sessions", 4_096)),
-            residency_tracking_enabled=bool(
-                extra_config.get("residency_tracking_enabled", False)
+            max_sessions=positive_int(extra_config, "lifecycle_max_sessions", 4_096),
+            residency_tracking_enabled=boolean(
+                extra_config, "residency_tracking_enabled", False
             ),
         )
 
@@ -144,11 +179,21 @@ def has_stable_session_id(req_context: ReqContext) -> bool:
 class SessionLifecycleManager:
     """Manage Session state and its reverse Block ownership index."""
 
-    def __init__(self, config: LifecycleConfig):
+    def __init__(
+        self, config: LifecycleConfig, clock: Callable[[], float] = time.monotonic
+    ):
         self.config = config
-        self.residency = BlockResidencyTracker(config.residency_max_entries)
+        self._clock = clock
+        self.residency = BlockResidencyTracker(
+            config.residency_max_entries, clock=clock
+        )
+        self.tracking_rejections = 0
         self._sessions: dict[str, SessionKVState] = {}
         self._req_to_session: dict[str, str] = {}
+        # Content history outlives anonymous request metadata, including stores
+        # rejected by the cost gate. Bound it independently of cache residency.
+        self._prefix_requests: OrderedDict[OffloadKey, int] = OrderedDict()
+        self._request_keys: dict[str, set[OffloadKey]] = {}
         # Avoid scanning every retained session on every scheduler step.  TTL
         # deadlines change only on request lifecycle transitions, so keep the
         # next due deadline as a cheap admission gate for expiration work.
@@ -168,9 +213,18 @@ class SessionLifecycleManager:
         if not self.enabled and not track_heat:
             return session_id
 
-        now = time.monotonic()
+        if self.tracked(req_context):
+            return self._req_to_session[req_context.req_id]
+        now = self._clock()
         state = self._sessions.get(session_id)
         if state is None:
+            if len(self._sessions) >= self.config.max_sessions:
+                self._prune_finalized_idle(
+                    len(self._sessions) - self.config.max_sessions + 1
+                )
+            if len(self._sessions) >= self.config.max_sessions:
+                self.tracking_rejections += 1
+                return session_id
             state = SessionKVState(
                 session_id=session_id,
                 has_stable_id=has_stable_session_id(req_context),
@@ -202,7 +256,7 @@ class SessionLifecycleManager:
         state = self._get_by_req(req_context)
         if state is None:
             return
-        now = time.monotonic()
+        now = self._clock()
         if state.last_reuse_req_id != req_context.req_id:
             state.reuse_request_count += 1
             state.last_reuse_req_id = req_context.req_id
@@ -224,18 +278,49 @@ class SessionLifecycleManager:
 
     def record_request_keys(
         self, req_context: ReqContext, keys: Iterable[OffloadKey]
-    ) -> None:
+    ) -> bool:
+        """Atomically track all keys, or refuse cache admission without ownership."""
         if not self.enabled:
-            return
+            return False
         state = self._get_by_req(req_context)
         if state is None:
             self.on_new_request(req_context)
             state = self._get_by_req(req_context)
-        assert state is not None
-        key_list = list(keys)
+        if state is None:
+            return False
+        key_list = list(dict.fromkeys(keys))
+        if not self.residency.record_access(state.session_id, key_list):
+            self.tracking_rejections += 1
+            return False
         state.block_keys.update(key_list)
-        state.last_access_at = time.monotonic()
-        self.residency.record_access(state.session_id, key_list)
+        state.last_access_at = self._clock()
+        observed = self._request_keys.setdefault(req_context.req_id, set())
+        for key in key_list:
+            if key in observed:
+                continue
+            observed.add(key)
+            count = self._prefix_requests.pop(key, 0)
+            self._prefix_requests[key] = count + 1
+            if len(self._prefix_requests) > self.config.residency_max_entries:
+                self._prefix_requests.popitem(last=False)
+        return True
+
+    def get_admission_heat(
+        self, req_context: ReqContext, keys: Iterable[OffloadKey]
+    ) -> tuple[int, float]:
+        """Combine session returns with distinct-request content observations.
+
+        A batch uses its least-observed key so a hot prefix cannot supply the
+        history of an unrelated cold key. Repeated scheduler callbacks within
+        one request contribute only once. These fractions are historical hints,
+        not measured hit probabilities. Missing/evicted history is conservative.
+        """
+        if not self.tracked(req_context):
+            return 0, 0.0
+        count = min((self._prefix_requests.get(key, 0) for key in keys), default=0)
+        session_count, _ = self.get_session_heat(req_context)
+        count = max(session_count, count)
+        return (count, (count - 1) / count) if count else (0, 0.0)
 
     def on_request_finished(
         self,
@@ -246,12 +331,10 @@ class SessionLifecycleManager:
         if not self.enabled and not track_heat:
             return
         state = self._get_by_req(req_context)
-        if state is None:
-            self.on_new_request(req_context, track_heat=track_heat)
-            state = self._get_by_req(req_context)
-        assert state is not None
+        if state is None or req_context.req_id not in state.active_req_ids:
+            return
 
-        now = time.monotonic()
+        now = self._clock()
         state.active_req_ids.discard(req_context.req_id)
         state.retained_req_ids.add(req_context.req_id)
         state.last_access_at = now
@@ -271,17 +354,23 @@ class SessionLifecycleManager:
     def on_request_finalized(self, req_context: ReqContext) -> None:
         """Release per-request metadata after all asynchronous stores finish."""
         state = self._get_by_req(req_context)
-        self._req_to_session.pop(req_context.req_id, None)
         if state is None:
             return
+        if req_context.req_id in state.active_req_ids:
+            self.on_request_finished(req_context, track_heat=True)
+        self._req_to_session.pop(req_context.req_id, None)
+        self._request_keys.pop(req_context.req_id, None)
         state.retained_req_ids.discard(req_context.req_id)
         if state.active_req_ids or state.retained_req_ids:
             return
-        if state.has_stable_id:
+        # Request bookkeeping can end while idle ownership must survive until
+        # TTL. Otherwise anonymous copies silently escape expiration entirely.
+        if state.has_stable_id or state.ttl_deadline is not None:
             return
 
         self.residency.release_session(state.session_id)
         self._delete_state(state)
+        self._refresh_next_expiration()
 
     def expire_idle_sessions(
         self,
@@ -292,7 +381,7 @@ class SessionLifecycleManager:
         if not self.enabled or self.config.idle_ttl_sec <= 0:
             return ExpirationResult()
 
-        now = time.monotonic()
+        now = self._clock()
         if self._next_expiration_at is None or self._next_expiration_at > now:
             return ExpirationResult()
         protected_key_set = set(protected_keys)
@@ -305,7 +394,11 @@ class SessionLifecycleManager:
                 continue
             if state.block_keys.intersection(protected_key_set):
                 continue
-            if state.retained_req_ids.intersection(protected_req_set):
+            # Unfinalized requests may still own asynchronous work, even when
+            # a caller omitted its explicit protected request set.
+            if state.retained_req_ids or state.active_req_ids.intersection(
+                protected_req_set
+            ):
                 continue
 
             state.status = LifecycleStatus.EXPIRED
@@ -321,7 +414,7 @@ class SessionLifecycleManager:
         """Return whether TTL expiration needs scheduler-step work now."""
         return (
             self._next_expiration_at is not None
-            and self._next_expiration_at <= time.monotonic()
+            and self._next_expiration_at <= self._clock()
         )
 
     def prune_idle_sessions(self) -> ExpirationResult:
@@ -330,6 +423,11 @@ class SessionLifecycleManager:
         if excess <= 0:
             return ExpirationResult()
 
+        return self._prune_finalized_idle(excess)
+
+    def _prune_finalized_idle(self, count: int) -> ExpirationResult:
+        # Metadata pressure forgets idle hints; it must never imply deletion
+        # of the actual secondary-tier files.
         candidates = sorted(
             (
                 state
@@ -337,16 +435,18 @@ class SessionLifecycleManager:
                 if state.is_idle
                 and not state.active_req_ids
                 and not state.retained_req_ids
+                # Do not forget an expiration obligation to make metadata room.
+                # Until it expires, refuse new tracking at the hard session cap.
+                and state.ttl_deadline is None
             ),
             key=lambda state: state.last_access_at,
         )
         result = ExpirationResult()
-        for state in candidates[:excess]:
-            result.unreferenced_keys.update(
-                self.residency.release_session(state.session_id)
-            )
+        for state in candidates[:count]:
+            self.residency.release_session(state.session_id)
             self._delete_state(state)
             result.pruned_sessions += 1
+        self._refresh_next_expiration()
         return result
 
     def get_idle_cpu_candidates(
@@ -359,7 +459,7 @@ class SessionLifecycleManager:
         if require_idle_age:
             if self.config.cpu_demote_after_sec <= 0:
                 return []
-            idle_before = time.monotonic() - self.config.cpu_demote_after_sec
+            idle_before = self._clock() - self.config.cpu_demote_after_sec
         return self.residency.get_idle_cpu_candidates(
             limit=limit,
             idle_before=idle_before,
@@ -389,6 +489,7 @@ class SessionLifecycleManager:
             "active_sessions": active,
             "idle_sessions": idle,
             "retained_blocks": len(retained_blocks),
+            "tracking_rejections": self.tracking_rejections,
         }
 
     def heat_snapshot(self) -> dict[str, int]:
@@ -401,17 +502,27 @@ class SessionLifecycleManager:
             ),
         }
 
+    def tracked(self, req_context: ReqContext) -> bool:
+        return self._get_by_req(req_context) is not None
+
+    def pending_request_ids(self) -> set[str]:
+        """Requests whose lifecycle metadata has not yet been finalized."""
+        return set(self._req_to_session)
+
+    def has_active(self, req_context: ReqContext) -> bool:
+        state = self._get_by_req(req_context)
+        return state is not None and bool(state.active_req_ids)
+
     def _get_by_req(self, req_context: ReqContext) -> SessionKVState | None:
         session_id = self._req_to_session.get(req_context.req_id)
-        if session_id is None:
-            session_id = get_session_id(req_context)
-        return self._sessions.get(session_id)
+        return self._sessions.get(session_id) if session_id is not None else None
 
     def _delete_state(self, state: SessionKVState) -> None:
         state.status = LifecycleStatus.DELETED
         self._sessions.pop(state.session_id, None)
         for req_id in state.active_req_ids | state.retained_req_ids:
             self._req_to_session.pop(req_id, None)
+            self._request_keys.pop(req_id, None)
 
     def _refresh_next_expiration(self) -> None:
         if self.config.idle_ttl_sec <= 0:

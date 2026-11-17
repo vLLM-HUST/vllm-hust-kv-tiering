@@ -1,20 +1,39 @@
+"""Matched-host Ascend layout and copy plans, with opt-in real-NPU round trips."""
+
+import os
 import uuid
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("vllm.v1.kv_cache_interface")
+pytest.importorskip("vllm.v1.kv_offload.base")
+
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
     MambaSpec,
+    MLAAttentionSpec,
 )
-from vllm.v1.kv_offload.base import GPULoadStoreSpec
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCacheRef,
+    CanonicalKVCaches,
+    CanonicalKVCacheTensor,
+    GPULoadStoreSpec,
+)
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 from vllm_hust_kv_tiering.ascend_layout import build_layout
-from vllm_hust_kv_tiering.ascend_worker import AscendLayoutWorker
+from vllm_hust_kv_tiering.ascend_worker import (
+    AscendCopyWorker,
+    AscendLayoutWorker,
+    copy_plan,
+)
+
+pytestmark = pytest.mark.host
 
 
 def fixture(device="cpu", typed=False):
@@ -37,7 +56,7 @@ def fixture(device="cpu", typed=False):
                 ["mamba"],
                 MambaSpec(
                     block_size=8,
-                    shapes=((8,), (16,)),
+                    shapes=((8,), (8,)),
                     dtypes=(torch.int8, torch.int8),
                     mamba_cache_mode="align",
                 ),
@@ -46,7 +65,9 @@ def fixture(device="cpu", typed=False):
     )
     caches = {
         "attn": (raw[32:64].view(8, 4), raw[64:96].view(8, 4)),
-        "mamba": [raw[:32].view(4, 8), raw[32:].view(4, 16)],
+        # Native Ascend aligns the SSM row width with one attention K row.
+        # V occupies Mamba padding, so cross-group aliases share only SAME IDs.
+        "mamba": [raw[:32].view(4, 8), raw[32:64].view(4, 8)],
     }
     if typed:
         caches = {
@@ -65,7 +86,7 @@ def fixture(device="cpu", typed=False):
         )
         config.kv_cache_groups[1].kv_cache_spec = MambaSpec(
             block_size=4,
-            shapes=((4,), (4,)),
+            shapes=((4,), (2,)),
             dtypes=(torch.bfloat16, torch.float32),
             mamba_cache_mode="align",
         )
@@ -76,7 +97,7 @@ def test_logical_rows_retain_runner_storage_and_share_cpu_allocation():
     raw, config, caches = fixture()
     layout = build_layout(config, caches)
     assert layout.page_sizes == [24]
-    assert [r[0].page_size_bytes for r in layout.group_data_refs] == [16, 24]
+    assert [r[0].page_size_bytes for r in layout.group_data_refs] == [16, 16]
     assert [index for index, _ in layout.layers] == [0, 0]
     layout.layers[0][1][0][1].fill_(99)
     assert torch.all(raw[40:48] == 99)
@@ -86,13 +107,120 @@ def test_logical_rows_retain_runner_storage_and_share_cpu_allocation():
         build_layout(config, caches)
 
 
+@pytest.mark.parametrize("typed", [False, True])
+def test_rejects_cross_id_soa_alias_even_when_single_group_roundtrip_would_pass(typed):
+    raw, config, caches = fixture(typed=typed)
+    # Historical tiny fixture: SSM block1 occupies bytes48:64, overlapping
+    # attention K block2 at48:56. Per-group byte roundtrips missed this hazard.
+    unsafe_ssm = raw[32:].view(4, 16)
+    caches["mamba"][1] = unsafe_ssm.view(torch.float32) if typed else unsafe_ssm
+    config.kv_cache_groups[1].kv_cache_spec = MambaSpec(
+        block_size=4 if typed else 8,
+        shapes=((4,), (4,)) if typed else ((8,), (16,)),
+        dtypes=(torch.bfloat16, torch.float32) if typed else (torch.int8, torch.int8),
+        mamba_cache_mode="align",
+    )
+    with pytest.raises(ValueError, match="across canonical block IDs"):
+        build_layout(config, caches)
+
+
+def test_rejects_a_nonleading_logical_block_axis():
+    raw, config, caches = fixture()
+    caches["attn"] = (raw[32:64].view(2, 16), caches["attn"][1])
+    with pytest.raises(ValueError, match="leading block axis"):
+        build_layout(config, caches)
+
+
+def test_rejects_combined_kv_tensor_when_two_blocks_hide_nonleading_axis():
+    raw = torch.arange(16, dtype=torch.int8)
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=1, dtype=torch.int8
+    )
+    config = KVCacheConfig(
+        2, [KVCacheTensor(16, ["attn"])], [KVCacheGroupSpec(["attn"], spec)]
+    )
+    # Old divisibility check accepted shape[0] == count == 2 but silently
+    # grouped K0+K1 instead of K0+V0 into canonical block0.
+    combined = raw.view(2, 2, 4, 1, 1)
+    before = raw.clone()
+    with pytest.raises(ValueError, match="separate K/V tensor views"):
+        build_layout(config, {"attn": combined})
+    assert torch.equal(raw, before)
+
+
+@pytest.mark.parametrize("form", ["missing_v", "extra_plane", "non_tensor"])
+def test_full_attention_rejects_unknown_plane_contract(form):
+    _, config, caches = fixture()
+    k, v = caches["attn"]
+    caches["attn"] = {
+        "missing_v": [k],
+        "extra_plane": [k, v, k],
+        "non_tensor": [k, object()],
+    }[form]
+    with pytest.raises(ValueError, match="separate K/V|must be torch tensors"):
+        build_layout(config, caches)
+
+
+@pytest.mark.parametrize("form", ["state_count", "single_tensor", "shape", "dtype"])
+def test_mamba_rejects_views_not_matching_declared_state_contract(form):
+    _, config, caches = fixture()
+    if form == "state_count":
+        caches["mamba"] = caches["mamba"][:1]
+    elif form == "single_tensor":
+        caches["mamba"] = caches["mamba"][0]
+    elif form == "shape":
+        caches["mamba"][0] = caches["mamba"][0].view(8, 4)
+    else:
+        caches["mamba"][0] = caches["mamba"][0].to(torch.uint8)
+    with pytest.raises(
+        ValueError, match="declared state views|state view shape|state view dtype"
+    ):
+        build_layout(config, caches)
+
+
+@pytest.mark.parametrize("single_tensor", [False, True])
+def test_one_state_mamba_accepts_exact_declared_single_view(single_tensor):
+    state = torch.arange(16, dtype=torch.int8).view(2, 8)
+    spec = MambaSpec(
+        block_size=8, shapes=((8,),), dtypes=(torch.int8,), mamba_cache_mode="align"
+    )
+    config = KVCacheConfig(
+        2, [KVCacheTensor(16, ["mamba"])], [KVCacheGroupSpec(["mamba"], spec)]
+    )
+    layout = build_layout(config, {"mamba": state if single_tensor else [state]})
+    assert layout.group_data_refs[0][0].page_size_bytes == 8
+    assert layout.layers[0][1][0].data_ptr() == state.data_ptr()
+
+
+def test_mla_is_not_accidentally_treated_as_two_plane_full_attention():
+    # MLAAttentionSpec inherits FullAttentionSpec, but has a separate cache
+    # contract. Preserve this pre-existing safe single-plane form; it does not
+    # qualify arbitrary MLA formats or make all FullAttention tensors acceptable.
+    state = torch.arange(32, dtype=torch.int8).view(2, 4, 1, 4)
+    spec = MLAAttentionSpec(block_size=4, num_kv_heads=1, head_size=4, dtype=torch.int8)
+    config = KVCacheConfig(
+        2, [KVCacheTensor(32, ["mla"])], [KVCacheGroupSpec(["mla"], spec)]
+    )
+    layout = build_layout(config, {"mla": state})
+    assert layout.layers[0][1][0].shape == (2, 16)
+
+
+@pytest.mark.npu
 @pytest.mark.skipif(
-    not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires NPU"
+    os.environ.get("VLLM_KV_TIERING_RUN_NPU_TESTS") != "1"
+    or not hasattr(torch, "npu")
+    or not torch.npu.is_available(),
+    reason="requires VLLM_KV_TIERING_RUN_NPU_TESTS=1 and an available real Ascend NPU",
 )
 @pytest.mark.parametrize("typed", [False, True])
-def test_real_npu_soa_hybrid_store_restore_and_transaction_validation(typed):
-    torch.npu.set_device(0)
-    raw, config, caches = fixture("npu:0", typed)
+@pytest.mark.parametrize("device_index", [0, 1])
+def test_real_npu_soa_hybrid_store_restore_and_transaction_validation(
+    typed, device_index
+):
+    if device_index >= torch.npu.device_count():
+        pytest.skip("requested NPU is not visible")
+    torch.npu.set_device(device_index)
+    raw, config, caches = fixture(f"npu:{device_index}", typed)
     layout = build_layout(config, caches)
     region = SharedOffloadRegion(uuid.uuid4().hex, 4, 0, 4096, 48)
     worker = AscendLayoutWorker(layout, 2, 4, region)
@@ -107,18 +235,96 @@ def test_real_npu_soa_hybrid_store_restore_and_transaction_validation(typed):
             cpu = CPULoadStoreSpec([0, 1])
             worker.submit_store(group * 2, gpu, cpu)
             worker.wait({group * 2})
-            assert worker.get_finished()[0].transfer_size == (32 if group == 0 else 48)
+            assert worker.get_finished()[0].transfer_size == 32
             for row in layout.layers[group][1]:
                 row[1:3].zero_()
             worker.submit_load(group * 2 + 1, cpu, gpu)
             worker.wait({group * 2 + 1})
             worker.get_finished()
             assert torch.equal(raw.cpu(), expected)
+        # A historical Mamba block1 restore must not corrupt a distinct,
+        # subsequently modified/live attention block2 in their shared raw SoA.
+        gpu = GPULoadStoreSpec([1], [0, 1], [0, 1])
+        cpu = CPULoadStoreSpec([0])
+        worker.submit_store(4, gpu, cpu)
+        worker.wait({4})
+        worker.get_finished()
+        for row in layout.layers[0][1]:
+            row[2].fill_(77)
+        expected = raw.cpu()
+        for row in layout.layers[1][1]:
+            row[1].zero_()
+        worker.submit_load(5, cpu, gpu)
+        worker.wait({5})
+        worker.get_finished()
+        assert torch.equal(raw.cpu(), expected)
         before = raw.cpu()
         with pytest.raises(ValueError, match="device block"):
             worker.submit_load(
                 10, CPULoadStoreSpec([0]), GPULoadStoreSpec([1, 99], [2, 0], [0, 0])
             )
         assert torch.equal(raw.cpu(), before)
+    finally:
+        worker.shutdown()
+
+
+def test_group_alignment_and_padding():
+    refs = [[CanonicalKVCacheRef(0, 5)], [CanonicalKVCacheRef(1, 3)]]
+    gpu = GPULoadStoreSpec([7, 8, 9], [2, 1], [1, 3])
+    cpu = CPULoadStoreSpec([4, 5, 6])
+    assert copy_plan(gpu, cpu, refs, 2) == [
+        (0, 7, 4, 1, 5),
+        (0, 8, 5, 0, 5),
+        (1, 9, 6, 1, 3),
+    ]
+    with pytest.raises(ValueError, match="shorter"):
+        copy_plan(gpu, CPULoadStoreSpec([4]), refs, 2)
+
+
+@pytest.mark.npu
+@pytest.mark.skipif(
+    os.environ.get("VLLM_KV_TIERING_RUN_NPU_TESTS") != "1"
+    or not hasattr(torch, "npu")
+    or not torch.npu.is_available(),
+    reason="requires VLLM_KV_TIERING_RUN_NPU_TESTS=1 and an available real Ascend NPU",
+)
+@pytest.mark.parametrize("device_index", [0, 1])
+def test_real_npu_hybrid_partial_page_round_trip(tmp_path, device_index):
+    if device_index >= torch.npu.device_count():
+        pytest.skip("requested NPU is not visible")
+    torch.npu.set_device(device_index)
+    tensors = [
+        torch.arange(64, dtype=torch.int8).view(4, 16).npu(),
+        (torch.arange(64, dtype=torch.int8) + 40).view(4, 16).npu(),
+    ]
+    expected = [tensor.cpu() for tensor in tensors]
+    caches = CanonicalKVCaches(
+        tensors=[CanonicalKVCacheTensor(t, 16) for t in tensors],
+        group_data_refs=[[CanonicalKVCacheRef(0, 11)], [CanonicalKVCacheRef(1, 7)]],
+    )
+    region = SharedOffloadRegion(
+        instance_id=uuid.uuid4().hex,
+        num_blocks=4,
+        rank=0,
+        kv_bytes_per_block=4096,
+        cpu_page_size=64,
+    )
+    worker = AscendCopyWorker(caches, 2, 4, region)
+    gpu = GPULoadStoreSpec([1, 2, 3], [2, 1], [1, 3])
+    cpu = CPULoadStoreSpec([0, 1, 2])
+    try:
+        assert worker.submit_store(1, gpu, cpu)
+        worker.wait({1})
+        assert worker.get_finished()[0].transfer_size == 29
+        tensors[0][1:3].zero_()
+        tensors[1][3].zero_()
+        assert worker.submit_load(2, cpu, gpu)
+        worker.wait({2})
+        assert worker.get_finished()[0].transfer_size == 29
+        assert torch.equal(tensors[0][1:3, :11].cpu(), expected[0][1:3, :11])
+        assert torch.equal(tensors[1][3, :7].cpu(), expected[1][3, :7])
+        assert torch.count_nonzero(tensors[0][1:3, 11:]).item() == 0
+        assert torch.count_nonzero(tensors[1][3, 7:]).item() == 0
+        assert worker.get_finished() == []
     finally:
         worker.shutdown()

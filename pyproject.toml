@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-hust-kv-tiering"
-version = "0.1.1.dev0"
+version = "0.2.0.dev0"
 description = "KV cache tiering and lifecycle-management plugin for vLLM-HUST v1"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 license = "Apache-2.0"
 dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<10", "build>=1.2,<2", "ruff>=0.11,<1"]
 
 [project.entry-points."vllm.general_plugins"]
 hust_kv_tiering = "vllm_hust_kv_tiering:register"
@@ -19,9 +22,27 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "host: requires the matched frozen vLLM-HUST and torch runtime",
+  "npu: real Ascend hardware; also requires VLLM_KV_TIERING_RUN_NPU_TESTS=1",
+]
 
 [project.entry-points."vllm_hust.extension_bundles"]
 "org.vllm-hust.kv-tiering" = "vllm_hust_kv_tiering.manifests"
 
 [tool.setuptools.package-data]
 vllm_hust_kv_tiering = ["manifests/*.json"]
+
+[tool.ruff]
+target-version = "py310"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vllm_hust_kv_tiering"]
+
+[tool.ruff.lint.per-file-ignores]
+# Optional matched-host imports intentionally follow pytest.importorskip.
+"**/tests/*.py" = ["E402"]
