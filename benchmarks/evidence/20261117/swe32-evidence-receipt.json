@@ -1,0 +1,6 @@
+{
+  "path": "swe32-complete-and-source-evidence.tar.gz",
+  "bytes": 57254248,
+  "sha256": "ad7be245fe0942d2dd3070e5d7bfad11338a9bbd8a6c84bce29fe646ce18d294",
+  "scope": "Six completed SWE32 arms plus measured source snapshot; not pressure completion"
+}

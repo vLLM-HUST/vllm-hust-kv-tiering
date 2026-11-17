@@ -21,7 +21,9 @@ from vllm_hust_kv_tiering.lifecycle import SessionLifecycleManager
 from vllm_hust_kv_tiering.policy import (
     PressureGate,
     TieringPolicyConfig,
+    WorkingSetAdmission,
     admission_reason,
+    positive_int,
 )
 from vllm_hust_kv_tiering.residency import TieringMetrics
 
@@ -140,6 +142,9 @@ class LifecycleAwareManager:
         self._delegate, self._lifecycle = delegate, lifecycle
         self.policy = policy or TieringPolicyConfig()
         self._clock = clock
+        self._working_set = WorkingSetAdmission(self.policy, clock=clock)
+        self._request_store_blocks: Counter[str] = Counter()
+        self._request_store_skips: dict[str, str] = {}
         self._cpu = CPUPrimaryControl(delegate.primary_tier)
         self._hbm_gate = PressureGate(self.policy.hbm_high, self.policy.hbm_low)
         config = lifecycle.config
@@ -168,11 +173,15 @@ class LifecycleAwareManager:
         self._closed = False
         self._shutdown_done = False
         self._counts: Counter[str] = Counter()
+        self._pipeline: Counter[str] = Counter()
+        self._pipeline_reported: Counter[str] = Counter()
         self._metric_counts: Counter[str] = Counter()
         self._lifecycle_metric_totals: Counter[str] = Counter()
-        self._bytes_per_block, self._tokens_per_block = (
-            bytes_per_block,
-            tokens_per_block,
+        self._bytes_per_block = positive_int(
+            {"bytes_per_block": bytes_per_block}, "bytes_per_block", 1
+        )
+        self._tokens_per_block = positive_int(
+            {"tokens_per_block": tokens_per_block}, "tokens_per_block", 1
         )
         tiers = [
             _ObservedTier(tier, self, i)
@@ -249,7 +258,9 @@ class LifecycleAwareManager:
         self._metric_counts[reason] += 1
 
     def on_new_request(self, req_context):
-        self._maintenance(force=True)
+        # Respect the maintenance interval; scanning the entire CPU index on
+        # every request arrival would put O(cache size) work in the hot path.
+        self._maintenance()
         self._lifecycle.on_new_request(req_context, track_heat=True)
         return self._delegate.on_new_request(req_context)
 
@@ -265,6 +276,8 @@ class LifecycleAwareManager:
         context = self._finished_requests.pop(req_id, None)
         if context is not None:
             self._lifecycle.on_request_finalized(context)
+            self._request_store_blocks.pop(req_id, None)
+            self._request_store_skips.pop(req_id, None)
         self._pending_requests.pop(req_id, None)
 
     def _owned(self, keys, req_context) -> bool:
@@ -286,15 +299,20 @@ class LifecycleAwareManager:
         return True
 
     def lookup(self, key, req_context):
+        self._pipeline["lookup_attempt_blocks"] += 1
         if key in self._delete_queue or key in self._delete_active:
+            self._pipeline["lookup_rejected_blocks"] += 1
             return LookupResult.MISS
         if not self._owned([key], req_context):
+            self._pipeline["lookup_rejected_blocks"] += 1
             return LookupResult.MISS
+        self._working_set.observe((key,))
         prior = self._cpu.status(key)
         if prior is None and self._cpu.free_slots == 0:
             self._reclaim(1, protected={key}, pressure=True)
             if self._cpu.free_slots == 0:
                 self._decision("promotion_no_free_slot")
+                self._pipeline["lookup_rejected_blocks"] += 1
                 return LookupResult.MISS
         result = self._delegate.lookup(key, req_context)
         current = self._cpu.status(key)
@@ -307,6 +325,11 @@ class LifecycleAwareManager:
         if result == LookupResult.HIT:
             self._mark_cpu([key], self._cpu.ready(key))
             self._lifecycle.record_reuse_hit(req_context)
+            self._pipeline["lookup_hit_blocks"] += 1
+        elif result == LookupResult.MISS:
+            self._pipeline["lookup_miss_blocks"] += 1
+        else:
+            self._pipeline["lookup_pending_blocks"] += 1
         return result
 
     def touch(self, keys, req_context):
@@ -320,6 +343,15 @@ class LifecycleAwareManager:
             self._owned(known, req_context)
         self._delegate.touch(keys, req_context)
 
+    def store_request_skipped(self, req_id: str) -> bool:
+        """Whether a lifetime admission decision suppresses future store jobs.
+
+        The scheduler may omit only store candidate construction for these
+        requests. Completion polling, loads and host progress remain untouched.
+        Transient pressure, step budgets and busy storage never enter this set.
+        """
+        return req_id in self._request_store_skips
+
     def prepare_store(self, keys, req_context):
         keys = list(keys)
         if self._closed or not self.should_build_store_jobs():
@@ -327,56 +359,89 @@ class LifecycleAwareManager:
         if any(key in self._delete_queue or key in self._delete_active for key in keys):
             self._decision("ttl_delete_pending")
             return None
-        stores = sum(
-            count for (_, store, _), count in self._device_jobs.items() if store
-        )
-        if stores >= self.policy.max_inflight_store_jobs:
-            self._decision("inflight_budget")
-            return None
-        if self._step_blocks >= self.policy.max_store_blocks_per_step:
-            self._decision("step_budget")
-            return None
         if not self._owned(keys, req_context):
             return None
-        requests, probability = self._lifecycle.get_session_heat(req_context)
-        reason = admission_reason(
-            self.policy,
-            requests=requests,
-            reuse_probability=probability,
-            num_blocks=len(keys),
-            bytes_per_block=self._bytes_per_block,
-            tokens_per_block=self._tokens_per_block,
-        )
-        if reason:
-            self._decision(reason)
-            return None
-        fresh = [key for key in keys if self._cpu.status(key) is None]
-        if (
-            self._step_blocks
-            and self._step_blocks + len(fresh) > self.policy.max_store_blocks_per_step
-        ):
-            self._decision("step_budget")
-            return None
-        if len(fresh) > self._cpu.capacity:
-            self._decision("request_exceeds_cpu_capacity")
-            return None
-        if self.secondary_tiers and self._cpu.free_slots < len(fresh):
-            self._reclaim(
-                len(fresh) - self._cpu.free_slots, protected=set(keys), pressure=True
-            )
-            if self._cpu.free_slots < len(fresh):
-                self._decision("waiting_for_safe_spill")
+        self._working_set.observe(keys)
+        # Estimate only missing copies. Existing or in-flight copies are still
+        # passed to the host unchanged so it owns deduplication/progress/pins.
+        fresh = [key for key in dict.fromkeys(keys) if self._cpu.status(key) is None]
+        if fresh:
+            if req_context.req_id in self._request_store_skips:
+                self._decision("request_store_skipped")
                 return None
+            stores = sum(
+                count for (_, store, _), count in self._device_jobs.items() if store
+            )
+            if stores >= self.policy.max_inflight_store_jobs:
+                self._decision("inflight_budget")
+                return None
+            if self._step_blocks >= self.policy.max_store_blocks_per_step:
+                self._decision("step_budget")
+                return None
+            reason = self._working_set.reason(
+                capacity_blocks=self._cpu.capacity,
+                free_blocks=self._cpu.free_slots,
+                new_blocks=len(fresh),
+                admitted_request_blocks=self._request_store_blocks[req_context.req_id],
+                bytes_per_block=self._bytes_per_block,
+            )
+            if reason:
+                # This is a request policy decision, not a retry deadline.
+                # Keep it across preemption until finalization; never advance
+                # the host's stored_idx or break a hybrid checkpoint bundle.
+                self._request_store_skips[req_context.req_id] = reason
+                self._decision(reason)
+                return None
+            requests, probability = self._lifecycle.get_admission_heat(
+                req_context, fresh
+            )
+            reason = admission_reason(
+                self.policy,
+                requests=requests,
+                reuse_probability=probability,
+                num_blocks=len(fresh),
+                bytes_per_block=self._bytes_per_block,
+                tokens_per_block=self._tokens_per_block,
+            )
+            if reason:
+                self._decision(reason)
+                return None
+            if (
+                self._step_blocks
+                and self._step_blocks + len(fresh)
+                > self.policy.max_store_blocks_per_step
+            ):
+                self._decision("step_budget")
+                return None
+            if len(fresh) > self._cpu.capacity:
+                self._decision("request_exceeds_cpu_capacity")
+                return None
+            if self.secondary_tiers and self._cpu.free_slots < len(fresh):
+                self._reclaim(
+                    len(fresh) - self._cpu.free_slots,
+                    protected=set(keys),
+                    pressure=True,
+                )
+                if self._cpu.free_slots < len(fresh):
+                    self._decision("waiting_for_safe_spill")
+                    return None
         output = self._delegate.prepare_store(keys, req_context)
         if output is None:
             self._decision("primary_busy")
             return None
-        self._mark_cpu(output.evicted_keys, False)
+        evicted = list(output.evicted_keys)
+        self._mark_cpu(evicted, False)
+        self._pipeline["primary_evicted_blocks"] += len(evicted)
         accepted = list(output.keys_to_store)
         if accepted:
             self._start_device(accepted, req_context, store=True)
             self._step_blocks += len(accepted)
+            self._pipeline["store_submitted_blocks"] += len(accepted)
+            if self.policy.working_set_aware:
+                self._request_store_blocks[req_context.req_id] += len(accepted)
             self._decision("admitted")
+        elif not fresh:
+            self._decision("already_present")
         return output
 
     def prepare_load(self, keys, req_context):
@@ -385,6 +450,7 @@ class LifecycleAwareManager:
             raise RuntimeError("load admission lost tracked ownership")
         spec = self._delegate.prepare_load(keys, req_context)
         self._start_device(keys, req_context, store=False)
+        self._pipeline["load_submitted_blocks"] += len(keys)
         return spec
 
     def _start_device(self, keys, context, *, store):
@@ -412,12 +478,16 @@ class LifecycleAwareManager:
         self._delegate.complete_store(keys, req_context, success)
         self._mark_cpu(keys, success)
         self._finish_device(keys, req_context, store=True)
+        self._pipeline[
+            "store_completed_blocks" if success else "store_failed_blocks"
+        ] += len(keys)
         self._maybe_finalize(req_context.req_id)
 
     def complete_load(self, keys, req_context):
         keys = list(keys)
         self._delegate.complete_load(keys, req_context)
         self._finish_device(keys, req_context, store=False)
+        self._pipeline["load_completed_blocks"] += len(keys)
         self._maybe_finalize(req_context.req_id)
 
     def _secondary_started(self, tier, metadata, manual):
@@ -658,6 +728,9 @@ class LifecycleAwareManager:
         self._device_jobs.clear()
         self.residency.clear_cpu_residency()
         self._known_cpu_keys.clear()
+        self._working_set.reset()
+        # Keep request-level skip decisions until finalization even after a
+        # cache reset; otherwise a preempted/continued request silently retries.
         for tier in self.secondary_tiers:
             tier._finish_requests()
         self._hbm_gate.active = self._cpu_gate.active = False
@@ -667,6 +740,9 @@ class LifecycleAwareManager:
             "hbm_pressure": self._hbm_usage,
             "hbm_gate": self._hbm_gate.active,
             "cpu_occupancy": self._cpu.occupancy,
+            "cpu_capacity_blocks": self._cpu.capacity,
+            "cpu_free_blocks": self._cpu.free_slots,
+            "host_payload_bytes_per_block": self._bytes_per_block,
             "cpu_gate": self._cpu_gate.active,
             "step_store_blocks": self._step_blocks,
             "manual_spill_jobs": self._manual_jobs,
@@ -675,6 +751,16 @@ class LifecycleAwareManager:
             "decisions": dict(self._counts),
             "sessions": self._lifecycle.snapshot(),
             "residency": self.residency.snapshot(),
+            "working_set": self._working_set.snapshot(
+                bytes_per_block=self._bytes_per_block
+            ),
+            "store_skipped_requests": len(self._request_store_skips),
+            "pipeline_blocks": dict(self._pipeline),
+            "pipeline_bytes": {
+                stage: count * self._bytes_per_block
+                for stage, count in self._pipeline.items()
+                if not stage.startswith("lookup_")
+            },
         }
 
     def get_stats(self):
@@ -709,6 +795,21 @@ class LifecycleAwareManager:
             TieringMetrics.SESSION_STATES, sessions["idle_sessions"], ("idle",)
         )
         stats.set_gauge(TieringMetrics.MIGRATION_BUDGET, self._step_blocks, ("step",))
+        working_set = self._working_set.snapshot(bytes_per_block=self._bytes_per_block)
+        stats.set_gauge(
+            TieringMetrics.WORKING_SET_BLOCKS, working_set["tracked_blocks"]
+        )
+        stats.set_gauge(TieringMetrics.WORKING_SET_BYTES, working_set["tracked_bytes"])
+        stats.set_gauge(
+            TieringMetrics.WORKING_SET_CENSORED, int(working_set["censored"])
+        )
+        for stage, total in self._pipeline.items():
+            stats.increase_counter(
+                TieringMetrics.PIPELINE_BLOCKS,
+                total - self._pipeline_reported[stage],
+                (stage,),
+            )
+            self._pipeline_reported[stage] = total
         for key, metric, labels in (
             ("expired_sessions", TieringMetrics.EXPIRED_SESSIONS, ()),
             ("cpu_reclaimed", TieringMetrics.PRIMARY_RECLAIMED_BLOCKS, ("policy",)),

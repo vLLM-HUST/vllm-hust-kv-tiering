@@ -197,7 +197,6 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertEqual(self.manager.snapshot()["idle_sessions"], 1)
 
     def test_finalized_ephemeral_removed_and_finalization_is_idempotent(self):
-        self.manager = self.make_manager(idle_ttl_sec=5)
         req = request("ephemeral")
         self.add(req, [b"a"])
         self.manager.on_request_finished(req)
@@ -210,6 +209,77 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertEqual(self.manager.residency.get_session_keys("ephemeral"), set())
         self.assertEqual(self.manager.residency._blocks[b"a"].session_ids, set())
         self.assertFalse(self.manager.has_pending_expiration())
+
+    def test_finalized_anonymous_ownership_expires_at_ttl_not_finalization(self):
+        self.manager = self.make_manager(idle_ttl_sec=5)
+        req = request("ephemeral")
+        self.add(req, [b"a"])
+        self.finish(req)
+        self.manager.on_request_finalized(req)
+        self.assertFalse(self.manager.tracked(req))
+        self.assertEqual(self.manager.pending_request_ids(), set())
+        self.assertEqual(self.manager.snapshot()["idle_sessions"], 1)
+        self.assertEqual(self.manager.residency.get_session_keys("ephemeral"), {b"a"})
+        self.clock.advance(4)
+        self.assertEqual(self.manager.expire_idle_sessions().expired_sessions, 0)
+        self.clock.advance(1)
+        expired = self.manager.expire_idle_sessions()
+        self.assertEqual(expired.expired_sessions, 1)
+        self.assertEqual(expired.unreferenced_keys, {b"a"})
+        self.assertEqual(self.manager.snapshot()["sessions"], 0)
+        self.assertFalse(self.manager.has_pending_expiration())
+        self.assertEqual(self.manager.expire_idle_sessions().expired_sessions, 0)
+
+    def test_session_cap_preserves_anonymous_ttl_obligation(self):
+        self.manager = self.make_manager(max_sessions=1, idle_ttl_sec=5)
+        first, second = request("first"), request("second")
+        self.add(first, [b"a"])
+        self.finish(first)
+        self.manager.on_new_request(second)
+        self.assertFalse(self.manager.tracked(second))
+        self.assertEqual(self.manager.snapshot()["sessions"], 1)
+        self.assertEqual(self.manager.residency.get_session_keys("first"), {b"a"})
+        self.clock.advance(5)
+        self.assertEqual(self.manager.expire_idle_sessions().unreferenced_keys, {b"a"})
+        self.manager.on_new_request(second)
+        self.assertTrue(self.manager.tracked(second))
+
+    def test_prefix_history_counts_distinct_interleaved_requests_not_callbacks(self):
+        first, second = request("first"), request("second")
+        self.add(first, [b"shared"])
+        self.assertEqual(self.manager.get_admission_heat(first, [b"shared"]), (1, 0.0))
+        self.add(second, [b"shared"])
+        for req in (first, second, first, second):
+            self.manager.record_request_keys(req, [b"shared", b"shared"])
+            self.assertEqual(
+                self.manager.get_admission_heat(req, [b"shared"]), (2, 0.5)
+            )
+        self.finish(first)
+        self.finish(second)
+        self.assertEqual(self.manager.pending_request_ids(), set())
+        self.assertEqual(self.manager._request_keys, {})
+        third = request("third")
+        self.add(third, [b"shared", b"cold"])
+        self.assertEqual(
+            self.manager.get_admission_heat(third, [b"shared"]), (3, 2 / 3)
+        )
+        self.assertEqual(
+            self.manager.get_admission_heat(third, [b"shared", b"cold"]), (1, 0.0)
+        )
+
+    def test_prefix_history_is_bounded_and_forgotten_keys_start_cold(self):
+        self.manager = self.make_manager(residency_max_entries=2)
+        for index in range(20):
+            req = request(f"req-{index}")
+            self.add(req, [f"key-{index}".encode()])
+            self.finish(req)
+            self.assertLessEqual(len(self.manager._prefix_requests), 2)
+            self.assertEqual(self.manager._request_keys, {})
+            self.assertEqual(self.manager.snapshot()["sessions"], 0)
+        req = request("repeat")
+        self.add(req, [b"key-0", b"key-19"])
+        self.assertEqual(self.manager.get_admission_heat(req, [b"key-0"]), (1, 0.0))
+        self.assertEqual(self.manager.get_admission_heat(req, [b"key-19"]), (2, 0.5))
 
     def test_finalize_without_finished_does_not_leak_active_ephemeral(self):
         req = request("ephemeral")

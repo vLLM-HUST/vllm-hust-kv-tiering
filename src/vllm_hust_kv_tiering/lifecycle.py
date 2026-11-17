@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -189,6 +190,10 @@ class SessionLifecycleManager:
         self.tracking_rejections = 0
         self._sessions: dict[str, SessionKVState] = {}
         self._req_to_session: dict[str, str] = {}
+        # Content history outlives anonymous request metadata, including stores
+        # rejected by the cost gate. Bound it independently of cache residency.
+        self._prefix_requests: OrderedDict[OffloadKey, int] = OrderedDict()
+        self._request_keys: dict[str, set[OffloadKey]] = {}
         # Avoid scanning every retained session on every scheduler step.  TTL
         # deadlines change only on request lifecycle transitions, so keep the
         # next due deadline as a cheap admission gate for expiration work.
@@ -289,7 +294,33 @@ class SessionLifecycleManager:
             return False
         state.block_keys.update(key_list)
         state.last_access_at = self._clock()
+        observed = self._request_keys.setdefault(req_context.req_id, set())
+        for key in key_list:
+            if key in observed:
+                continue
+            observed.add(key)
+            count = self._prefix_requests.pop(key, 0)
+            self._prefix_requests[key] = count + 1
+            if len(self._prefix_requests) > self.config.residency_max_entries:
+                self._prefix_requests.popitem(last=False)
         return True
+
+    def get_admission_heat(
+        self, req_context: ReqContext, keys: Iterable[OffloadKey]
+    ) -> tuple[int, float]:
+        """Combine session returns with distinct-request content observations.
+
+        A batch uses its least-observed key so a hot prefix cannot supply the
+        history of an unrelated cold key. Repeated scheduler callbacks within
+        one request contribute only once. These fractions are historical hints,
+        not measured hit probabilities. Missing/evicted history is conservative.
+        """
+        if not self.tracked(req_context):
+            return 0, 0.0
+        count = min((self._prefix_requests.get(key, 0) for key in keys), default=0)
+        session_count, _ = self.get_session_heat(req_context)
+        count = max(session_count, count)
+        return (count, (count - 1) / count) if count else (0, 0.0)
 
     def on_request_finished(
         self,
@@ -328,10 +359,13 @@ class SessionLifecycleManager:
         if req_context.req_id in state.active_req_ids:
             self.on_request_finished(req_context, track_heat=True)
         self._req_to_session.pop(req_context.req_id, None)
+        self._request_keys.pop(req_context.req_id, None)
         state.retained_req_ids.discard(req_context.req_id)
         if state.active_req_ids or state.retained_req_ids:
             return
-        if state.has_stable_id:
+        # Request bookkeeping can end while idle ownership must survive until
+        # TTL. Otherwise anonymous copies silently escape expiration entirely.
+        if state.has_stable_id or state.ttl_deadline is not None:
             return
 
         self.residency.release_session(state.session_id)
@@ -401,6 +435,9 @@ class SessionLifecycleManager:
                 if state.is_idle
                 and not state.active_req_ids
                 and not state.retained_req_ids
+                # Do not forget an expiration obligation to make metadata room.
+                # Until it expires, refuse new tracking at the hard session cap.
+                and state.ttl_deadline is None
             ),
             key=lambda state: state.last_access_at,
         )
@@ -485,6 +522,7 @@ class SessionLifecycleManager:
         self._sessions.pop(state.session_id, None)
         for req_id in state.active_req_ids | state.retained_req_ids:
             self._req_to_session.pop(req_id, None)
+            self._request_keys.pop(req_id, None)
 
     def _refresh_next_expiration(self) -> None:
         if self.config.idle_ttl_sec <= 0:

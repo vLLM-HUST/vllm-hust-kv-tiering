@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import math
+import time
+from collections import OrderedDict
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,8 +55,15 @@ class TieringPolicyConfig:
     benefit_safety_factor: float = 1.2
     maintenance_interval_sec: float = 0.05
     retry_backoff_sec: float = 1.0
+    working_set_aware: bool = False
+    working_set_window_sec: float = 60.0
+    working_set_max_entries: int = 64_000
+    working_set_max_new_bytes: int = 64 * 1024 * 1024
 
     def __post_init__(self) -> None:
+        boolean(
+            {"working_set_aware": self.working_set_aware}, "working_set_aware", False
+        )
         if not 0 < self.hbm_low <= self.hbm_high <= 1:
             raise ValueError("HBM watermarks must satisfy 0 < low <= high <= 1")
         if not 0 <= self.min_reuse_probability <= 1:
@@ -76,7 +86,12 @@ class TieringPolicyConfig:
             or self.benefit_safety_factor < 1
         ):
             raise ValueError("tiering_benefit_safety_factor must be finite and >= 1")
-        for value in (self.maintenance_interval_sec, self.retry_backoff_sec):
+        for value in (
+            self.maintenance_interval_sec,
+            self.retry_backoff_sec,
+            self.working_set_window_sec,
+        ):
+            finite({"policy interval": value}, "policy interval", 1.0)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(
                     "maintenance interval and retry backoff must be positive"
@@ -86,6 +101,8 @@ class TieringPolicyConfig:
             self.max_inflight_store_jobs,
             self.max_spill_jobs,
             self.min_session_requests,
+            self.working_set_max_entries,
+            self.working_set_max_new_bytes,
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError("policy limits must be positive integers")
@@ -108,6 +125,10 @@ class TieringPolicyConfig:
             "tiering_benefit_safety_factor",
             "tiering_maintenance_interval_sec",
             "tiering_retry_backoff_sec",
+            "tiering_working_set_aware",
+            "tiering_working_set_window_sec",
+            "tiering_working_set_max_entries",
+            "tiering_working_set_max_new_bytes",
         }
         # Previously these keys were silently ignored. Reject, do not pretend
         # to implement GPU eviction or phase-specific scheduler rewrites.
@@ -150,6 +171,16 @@ class TieringPolicyConfig:
                 extra, "tiering_maintenance_interval_sec", 0.05
             ),
             retry_backoff_sec=finite(extra, "tiering_retry_backoff_sec", 1.0),
+            working_set_aware=boolean(extra, "tiering_working_set_aware", False),
+            working_set_window_sec=finite(
+                extra, "tiering_working_set_window_sec", 60.0
+            ),
+            working_set_max_entries=positive_int(
+                extra, "tiering_working_set_max_entries", 64_000
+            ),
+            working_set_max_new_bytes=positive_int(
+                extra, "tiering_working_set_max_new_bytes", 64 * 1024 * 1024
+            ),
         )
 
 
@@ -200,3 +231,85 @@ def admission_reason(
         ):
             return "estimated_cost"
     return None
+
+
+class WorkingSetAdmission:
+    """Bounded recent candidate-key working set, not a model/task-size formula.
+
+    Keys retain the host's full identity (including cache groups and salt).
+    A censored window is explicitly uncertain: forgetting keys must not claim
+    that an oversized set now fits. All decisions run on the scheduler thread.
+    """
+
+    def __init__(
+        self,
+        config: TieringPolicyConfig,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.config = config
+        self._clock = clock
+        self._recent: OrderedDict[Hashable, float] = OrderedDict()
+        self._overflow_until = float("-inf")
+
+    def _expire(self, now: float) -> None:
+        cutoff = now - self.config.working_set_window_sec
+        while self._recent and next(iter(self._recent.values())) <= cutoff:
+            self._recent.popitem(last=False)
+
+    def observe(self, keys: Iterable[Hashable]) -> None:
+        if not self.config.working_set_aware:
+            return
+        now = self._clock()
+        self._expire(now)
+        for key in keys:
+            self._recent.pop(key, None)
+            self._recent[key] = now
+            if len(self._recent) > self.config.working_set_max_entries:
+                _, last_seen = self._recent.popitem(last=False)
+                self._overflow_until = max(
+                    self._overflow_until,
+                    last_seen + self.config.working_set_window_sec,
+                )
+
+    def reason(
+        self,
+        *,
+        capacity_blocks: int,
+        free_blocks: int,
+        new_blocks: int,
+        admitted_request_blocks: int,
+        bytes_per_block: int,
+    ) -> str | None:
+        if not self.config.working_set_aware or new_blocks == 0:
+            return None
+        now = self._clock()
+        self._expire(now)
+        exceeds_capacity = len(self._recent) > capacity_blocks
+        uncertain = now < self._overflow_until
+        # Free space is real allocator telemetry. High HBM pressure alone is
+        # not CPU churn, and a full CPU cache alone does not imply churn either.
+        if new_blocks <= free_blocks or not (exceeds_capacity or uncertain):
+            return None
+        # Cumulative request writes prevent chunked prefill from bypassing the
+        # cold-fill budget by submitting many individually small batches.
+        request_bytes = (admitted_request_blocks + new_blocks) * bytes_per_block
+        if request_bytes > self.config.working_set_max_new_bytes:
+            return "working_set_uncertain" if uncertain else "working_set_capacity"
+        return None
+
+    def snapshot(self, *, bytes_per_block: int) -> dict[str, int | float | bool]:
+        now = self._clock()
+        self._expire(now)
+        return {
+            "enabled": self.config.working_set_aware,
+            "window_sec": self.config.working_set_window_sec,
+            "tracked_blocks": len(self._recent),
+            "tracked_bytes": len(self._recent) * bytes_per_block,
+            "censored": now < self._overflow_until,
+            "max_new_bytes_per_request": self.config.working_set_max_new_bytes,
+        }
+
+    def reset(self) -> None:
+        self._recent.clear()
+        self._overflow_until = float("-inf")

@@ -1,0 +1,12 @@
+Processing ./CGCL/kv-tiering-pr-working-set-20261117
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: vllm-hust-kv-tiering
+  Building wheel for vllm-hust-kv-tiering (pyproject.toml): started
+  Building wheel for vllm-hust-kv-tiering (pyproject.toml): finished with status 'done'
+  Created wheel for vllm-hust-kv-tiering: filename=vllm_hust_kv_tiering-0.2.0.dev0-py3-none-any.whl size=63692 sha256=ca7cb781a24266d5cbdb741898df89b7bf6176fd7c798c30fdeeb6d8cdc1ffbc
+  Stored in directory: /root/.cache/pip/wheels/74/78/c8/382cbc7458dd87df3b0ce33e248c14a70d8d3b2780705b0aa6
+Successfully built vllm-hust-kv-tiering
+
+[notice] A new release of pip is available: 25.0.1 -> 26.3
+[notice] To update, run: python -m pip install --upgrade pip

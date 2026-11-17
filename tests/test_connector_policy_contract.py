@@ -10,6 +10,9 @@ pytest.importorskip("vllm.v1.kv_offload.tiering.spec")
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    OffloadingConnectorScheduler,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 from vllm.v1.kv_offload import base as host_base
@@ -144,6 +147,66 @@ def test_low_pressure_hook_defers_without_touching_host_progress(
         assert sentinel.next_stored_block_idx == 7
     finally:
         del scheduler._req_status["sentinel"]
+
+
+def test_lifetime_rejection_avoids_host_candidate_rebuild(monkeypatch, connector):
+    scheduler = connector.connector_scheduler
+    tick(connector)
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {"rejected": 4096}
+    scheduler.manager._request_store_skips["rejected"] = "working_set_capacity"
+
+    def unexpected(*args):
+        pytest.fail("permanently rejected request rebuilt host store candidates")
+
+    monkeypatch.setattr(OffloadingConnectorScheduler, "_build_store_jobs", unexpected)
+    assert scheduler._build_store_jobs(output) == {}
+    assert output.num_scheduled_tokens == {"rejected": 4096}
+
+
+def test_mixed_store_view_preserves_original_scheduler_output(monkeypatch, connector):
+    scheduler = connector.connector_scheduler
+    tick(connector)
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {"rejected": 4096, "eligible": 256}
+    output.preempted_req_ids = {"rejected"}
+    scheduler.manager._request_store_skips["rejected"] = "working_set_capacity"
+    sentinel = SimpleNamespace(next_stored_block_idx=7, transfer_jobs={123})
+    scheduler._req_status["rejected"] = sentinel
+
+    def probe(instance, store_output):
+        assert instance is scheduler
+        assert store_output is not output
+        assert store_output.num_scheduled_tokens == {"eligible": 256}
+        assert store_output.preempted_req_ids is output.preempted_req_ids
+        return {456: "host-owned-job"}
+
+    monkeypatch.setattr(OffloadingConnectorScheduler, "_build_store_jobs", probe)
+    try:
+        assert scheduler._build_store_jobs(output) == {456: "host-owned-job"}
+        assert output.num_scheduled_tokens == {"rejected": 4096, "eligible": 256}
+        assert sentinel.next_stored_block_idx == 7
+        assert sentinel.transfer_jobs == {123}
+    finally:
+        del scheduler._req_status["rejected"]
+
+
+def test_transient_rejections_do_not_filter_future_store_attempts(
+    monkeypatch, connector
+):
+    scheduler = connector.connector_scheduler
+    tick(connector)
+    scheduler.manager._decision("step_budget")
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {"later": 4096}
+
+    def probe(instance, store_output):
+        assert instance is scheduler
+        assert store_output is output
+        return {789: "host-retry"}
+
+    monkeypatch.setattr(OffloadingConnectorScheduler, "_build_store_jobs", probe)
+    assert scheduler._build_store_jobs(output) == {789: "host-retry"}
 
 
 def test_complete_spec_manager_fs_promotion_roundtrip(connector):

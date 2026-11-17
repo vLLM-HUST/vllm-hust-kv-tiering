@@ -2,6 +2,12 @@
 
 Development version: `0.2.0.dev0` (scoped hardware validation; not production certification).
 
+The local 2026-11-16 revision adds optional candidate working-set admission,
+fresh-copy admission accounting and staged recovery telemetry. These additions
+have portable CPU contract tests only; the historical hardware results below
+do not qualify this new revision. See the [candidate profile](<examples/working-set-tiering.json>)
+and [configuration](<docs/configuration.md>) before running a matched-host comparison.
+
 > **The reference Ascend hybrid profile requires explicitly repaired SDKs.**
 > On the documented pair, the installed-payload suite passes 295 tests and
 > Native/CPU/FS each pass 80 strict MTP2 retrieval responses, including cached
@@ -30,6 +36,8 @@ install or replace them, start a server, or enable offloading automatically.
 
 - Device → CPU cache admission driven by scheduler block-pool pressure, with
   high/low hysteresis, preemption signals, bounded jobs and whole-request budgets.
+- Optional bounded candidate working-set admission to reject large cold fills
+  under CPU capacity pressure, with per-request cumulative write budgets.
 - CPU → filesystem spill and CPU reclamation based on occupancy or idle age.
   A CPU copy is not reclaimed for a spill until a secondary write succeeds.
 - Session/shared-prefix ownership, request-versus-transfer finalization, optional

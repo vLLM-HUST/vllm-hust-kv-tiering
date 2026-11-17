@@ -42,10 +42,27 @@ class TieringMetrics:
     TRANSFER_OPS = "vllm:kv_tiering_transfer_ops"
     WAIT_SECONDS = "vllm:kv_tiering_worker_wait_seconds"
     H2D_ADMISSION = "vllm:kv_tiering_h2d_submit_to_admitted_seconds"
+    WORKING_SET_BLOCKS = "vllm:kv_tiering_candidate_working_set_blocks"
+    WORKING_SET_BYTES = "vllm:kv_tiering_candidate_working_set_bytes"
+    WORKING_SET_CENSORED = "vllm:kv_tiering_candidate_working_set_censored"
+    PIPELINE_BLOCKS = "vllm:kv_tiering_pipeline_blocks"
 
 
 def build_tiering_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
     return {
+        TieringMetrics.WORKING_SET_BLOCKS: OffloadingGaugeMetadata(
+            documentation="Distinct recent host offload keys; a lower bound when censored."
+        ),
+        TieringMetrics.WORKING_SET_BYTES: OffloadingGaugeMetadata(
+            documentation="Recent candidate blocks times host payload bytes per block; not a pure-attention estimate."
+        ),
+        TieringMetrics.WORKING_SET_CENSORED: OffloadingGaugeMetadata(
+            documentation="Whether recent candidate-key history exceeded its metadata bound."
+        ),
+        TieringMetrics.PIPELINE_BLOCKS: OffloadingCounterMetadata(
+            documentation="Scheduler-observed block stages; lookup/load completion does not establish accepted prefix tokens or saved prefill.",
+            labelnames=("stage",),
+        ),
         TieringMetrics.RESIDENT_BLOCKS: OffloadingGaugeMetadata(
             documentation="Number of KV blocks observed in each offload tier.",
             labelnames=("tier",),

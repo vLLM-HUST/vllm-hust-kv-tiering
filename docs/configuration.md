@@ -115,8 +115,8 @@ larger default low watermark.
 | `tiering_hbm_low_watermark` | `0.6` | Close the gate at/below this fraction. |
 | `tiering_max_device_store_blocks_per_step` | `128` | Soft block budget: the first whole request can exceed it to preserve hybrid-group progress. |
 | `tiering_max_inflight_device_store_jobs` | `8` | Hard concurrent device-store admission limit. |
-| `tiering_min_session_requests_for_offload` | `1` | Minimum observed request count for a tracked session. |
-| `tiering_min_reuse_probability` | `0.0` | Minimum historical session-return fraction, in `[0, 1]`. |
+| `tiering_min_session_requests_for_offload` | `1` | Minimum observed request count from session returns or matching content. |
+| `tiering_min_reuse_probability` | `0.0` | Minimum historical session/content return fraction, in `[0, 1]`. |
 
 The connector samples the matched block pool in O(1), taking the maximum of
 allocation pressure (`BlockPool.get_usage()`) and the **cached-key pressure proxy**
@@ -170,9 +170,118 @@ spill/recovery path; keep that arm separate from CPU+FS when measuring benefits.
 All three rates must be zero (disabled) or all positive. These are supplied
 calibrations, not online measurements. Admission compares historical reuse
 fraction × (recompute cost − restore cost) against write cost × safety factor.
-The reuse estimate `(request_count - 1) / request_count` is a historical session
-return fraction, not a learned prediction. No fixed unmeasured throughput numbers
-are filled in automatically.
+The reuse estimate `(request_count - 1) / request_count` uses the larger of the
+session request count and matching-content request count. Content observations
+are keyed by the host's full offload key, survive anonymous request finalization,
+and count a given request only once per key, including misses and rejected stores.
+A batch uses its least-observed key so hot content cannot supply the history of
+an unrelated cold key. The LRU history is bounded by `residency_max_entries`;
+forgotten content starts cold. This is a historical hint, not a learned prediction.
+No fixed unmeasured throughput numbers are filled in automatically.
+
+### Optional candidate working-set admission
+
+This opt-in policy limits large cold fills when recent candidate prefixes do
+not fit the CPU pool. It borrows the working-set motivation of EfficientAgent,
+but estimates a recent set of **actual host offload keys**, not task count times
+a pure-attention bytes/token formula. It does not require LMCache or a different
+model/runtime. It is not an exact predictor of future reuse or a complete
+reimplementation of the paper.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `tiering_working_set_aware` | `false` | Enable candidate-set tracking and request-level cold-fill rejection. |
+| `tiering_working_set_window_sec` | `60.0` | Positive recency window for keys seen in lookup or store candidates. |
+| `tiering_working_set_max_entries` | `64000` | Hard metadata bound for recent distinct keys. |
+| `tiering_working_set_max_new_bytes` | `67108864` | New-write byte budget per request when the candidate set exceeds CPU capacity and insertion needs to displace existing/reserved slots. |
+
+The byte estimate uses the same `kv_bytes_per_offloaded_block` geometry as the
+host CPU allocator, including its mixed cache payload. Interpret it using that
+host's rank/shared-memory geometry, not an assumed per-rank pure-attention beta.
+The default 64 MiB is a configurable policy budget, **not** a calibrated optimum
+for Qwen3.5 or a measured bandwidth. Check the actual block size and choose a
+budget that can admit the desired whole checkpoint bundles.
+
+Repeated callbacks and shared keys do not enlarge the distinct set. Full key
+identities, including cache-group and salt isolation, remain unchanged. If the
+metadata bound is exceeded, the snapshot marks the window `censored`; the
+retained set is only a lower bound, and large fills under capacity displacement
+are conservatively rejected until the lost observations age out. A small
+metadata bound can therefore reject useful writes; size and report it explicitly.
+
+When free slots cover the candidate, normal admission remains available. When
+the recent set fits capacity, a full cache alone does not trigger rejection.
+Under over-capacity pressure, small appends remain eligible; cumulative bytes
+**submitted** by a request count toward its budget, including failed writes, so
+chunked prefill cannot bypass it. Such appends can still cause churn; the policy
+does not guarantee that every admitted write will be useful.
+
+A working-set rejection is sticky for that request until asynchronous
+finalization, including cache reset/preemption continuation. It does not mean
+"retry after one second". New requests are evaluated again. The manager never
+advances the host's stored prefix index and never filters/splits an offered
+hybrid bundle. After the first lifetime rejection, the plugin's thin store
+scheduler hook omits that request from subsequent store candidate construction.
+The original scheduler output still drives loads, completion polling, request
+updates, preemption and transfer flushes. No stored prefix index is advanced to
+pretend a rejected write succeeded. Transient budget/pressure refusals remain
+retryable. General host request bookkeeping and hashing still occur.
+
+Existing/in-flight CPU copies are passed back to the host unchanged, even if
+new-write budgets or request rejection would block allocation. They are not
+charged as fresh D2H writes; the host owns readiness, deduplication and progress.
+This manager-level rule does not require rebuilding store candidates for an
+already lifetime-rejected request. Other requests can still reuse its ready
+copies, and already submitted jobs complete through the original host path.
+History/cost gates evaluate missing copies, so an already-present cold key does
+not suppress a different repeatedly observed missing key. Mixed *missing* hot
+and cold keys still use conservative least-observed content history.
+
+Use [working-set-tiering.json](<../examples/working-set-tiering.json>) for an
+explicit CPU-only candidate arm; compare it with the same JSON with
+`tiering_working_set_aware: false`. Keep Native's APC, model, fixed host version,
+actual HBM configuration and other shared optimizations unchanged. Do not
+invent throughput calibrations or disable protocol-required salt isolation.
+This example defines an experimental policy profile, not a performance result.
+Record matched-host, real-device and model recovery qualification separately
+for the exact source revision and runtime; portable tests alone do not qualify it.
+
+### Distinguish lookup, transfers and effective recovery
+
+`get_policy_snapshot()` now includes `working_set`, `store_skipped_requests`,
+`pipeline_blocks` and `pipeline_bytes`. Stage counters distinguish:
+
+- `lookup_attempt_blocks`: per-key queries, including repeated callbacks;
+  `lookup_hit_blocks`, `lookup_miss_blocks`, `lookup_pending_blocks` and
+  `lookup_rejected_blocks` are their outcomes, not unique prefixes.
+- `store_submitted_blocks`, `store_completed_blocks`, `store_failed_blocks`:
+  device-store admission versus scheduler-observed successful/failed completion.
+- `load_submitted_blocks`, `load_completed_blocks`: device-load submission
+  versus the host's completion callback. Tentative FS-to-CPU promotions are not
+  counted as completed device restores.
+- `primary_evicted_blocks`: keys evicted by delegate device-store preparation,
+  excluding TTL deletion and explicit maintenance reclamation.
+
+The metrics are `vllm:kv_tiering_pipeline_blocks{stage=...}` and
+`vllm:kv_tiering_candidate_working_set_{blocks,bytes,censored}`. Counters are
+exported as deltas without counting repeated stats collection twice. Byte
+snapshots use block count times host payload size; lookup outcomes have no byte
+volume, and partial failed transfers are not measured as successful traffic.
+These are nominal payload sizes at each stage, not independently measured DMA
+traffic or bandwidth. The snapshot also records CPU capacity/free slots and
+`host_payload_bytes_per_block` to make its geometry auditable.
+
+Neither a HIT nor a successful load callback establishes a usable full mixed
+prefix, accepted external tokens, or saved prefill. Those require matched-host
+scheduler/model evidence. Do not compute "reuse hit rate" from D2H/H2D byte
+ratios. Automatic bandwidth calibration, a profitability-based load rejection
+hook and adaptive low-yield shutdown are **not implemented** by this change;
+the existing explicit calibrated store-cost gate remains optional.
+
+Maintenance on request arrival now respects the configured interval rather
+than forcing an O(cache size) scan for every new request. Transfer completion
+polling at `begin_step` is still unconditional. TTL maintenance remains
+scheduler-driven and best effort; no wall-clock erasure guarantee is introduced.
 
 ## Session ownership and TTL
 
@@ -189,9 +298,13 @@ Stable session identifiers are read from request `kv_transfer_params` as
 ephemeral. Concurrent requests in one session and shared prefix keys are tracked
 without releasing another active owner's protection. Request finish does not
 mean transfer finish. Deferred promotions, device copies and secondary jobs
-must be accounted for before finalization. Ephemeral state is removed on final
-completion; metadata pressure may forget finalized idle stable-session hints,
-but it does **not** implicitly delete their files or evict active ownership.
+must be accounted for before finalization. Finalization always releases request
+bookkeeping. With positive TTL, anonymous idle ownership remains until expiration
+just like stable-session ownership. With TTL disabled, anonymous ownership is
+released immediately; metadata pressure may forget finalized idle stable-session
+hints without deleting their files. Pending TTL ownership is never discarded to
+make metadata room: at the session cap new cache tracking is refused until space
+is available. Active ownership is never silently evicted.
 
 TTL is checked during scheduler activity and new-request/lookup processing.
 Idle engines do not spin until the deadline, so TTL is not a secure-erasure SLA.

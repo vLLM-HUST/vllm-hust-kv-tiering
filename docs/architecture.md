@@ -28,6 +28,18 @@ Safety invariants:
 
 ## Placement decisions
 
+The opt-in candidate working-set gate adds a CPU-capacity admission decision
+before new D2H allocation or explicit spill. It uses a bounded sliding window
+of full host offload keys and actual CPU slots, rejecting large cold fills when
+the observed set exceeds capacity (or history is censored) and the insertion
+cannot use free slots. A request's cumulative submitted bytes bound incremental
+fills; rejection lasts until request finalization. Existing copies still reach
+the host's ordinary no-op/readiness path. The offered key list is never split
+or rewritten, preserving the host's mixed Attention/GDN checkpoint contract.
+The candidate set is a heuristic, not the entire Agent working set or a proof
+of future reuse. Configuration, telemetry stages and remaining qualification
+requirements are described in [configuration](<configuration.md>).
+
 HBM admission uses the public `bind_gpu_block_pool` connector hook. Its O(1)
 pressure proxy is the maximum of `BlockPool.get_usage()` (non-evictable allocation
 pressure) and `len(pool.cached_block_hash_to_block) / (pool.num_gpu_blocks - 1)`,
@@ -55,11 +67,16 @@ The per-step block budget is consequently soft for the first whole request;
 concurrent-job and CPU-slot limits remain hard. This avoids starvation and
 prefix holes. Admission remains best effort, not a promise to save every prefix.
 
-Optional session-return and calibrated cost gates are conservative heuristics.
-The return fraction is historical session reuse, not a learned probability or a
-claim of future hits. A cost gate is active only with supplied, positive rates;
-it compares expected recomputation avoided with write plus restore costs. No
-unmeasured bandwidth/prefill constants are presented as online measurements.
+Optional session/content-return and calibrated cost gates are conservative
+heuristics. Content history counts distinct requests per full offload key,
+including misses and rejected stores, and survives anonymous finalization. It
+uses an LRU bounded by the block metadata budget; callbacks from the same request
+do not inflate counts. A batch uses its least-observed key, then combines that
+count with the session return count. The resulting fraction is a historical hint,
+not a learned probability or a claim of future hits. A cost gate is active only
+with supplied, positive rates; it compares expected recomputation avoided with
+write plus restore costs. No unmeasured bandwidth/prefill constants are presented
+as online measurements.
 
 CPU occupancy counts **all resident/reserved slots**, not only pinned slots.
 High/low hysteresis and idle age drive coldest-first spill/reclamation. Normal
@@ -77,10 +94,13 @@ in a session share ownership. Lookup/touch/load/store all contribute ownership,
 including cache hits, not only new stores.
 
 Request finish is not transfer finish. Finalization occurs only after outstanding
-primary and secondary work is accounted for. Stable idle sessions retain metadata
-until TTL or the configured metadata budget; ephemeral sessions release request
-metadata after finalization. Capacity admission rejects new cache tracking rather
-than growing without bound or discarding active ownership silently.
+primary and secondary work is accounted for. Finalization releases request
+metadata. With positive TTL, both stable and anonymous idle ownership survive
+until expiration; a metadata cap cannot silently discard an expiration obligation.
+With TTL disabled, anonymous ownership is released at finalization and finalized
+idle stable-session hints may be forgotten under metadata pressure without
+implying file deletion. Capacity admission rejects new cache tracking rather than
+growing without bound or discarding protected ownership silently.
 
 TTL is checked on scheduler activity and before new lookups. It does not keep the
 engine spinning until a future deadline. It is a cache-retention policy, not a
