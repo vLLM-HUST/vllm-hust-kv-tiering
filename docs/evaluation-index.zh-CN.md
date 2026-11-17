@@ -13,11 +13,13 @@
 
 - [集中补证 PR（Draft）](https://github.com/vLLM-HUST/vllm-hust-benchmark/pull/697)。
 
-- [完整SWE回放报告、分析与原件清单](https://github.com/vLLM-HUST/vllm-hust-benchmark/tree/c53e7d2b14ad77c181dbad2d898c288b8a1be608/reports/tech-outcomes-20261117/kv-tiering)。
+- [完整SWE回放报告、分析与原件清单](https://github.com/vLLM-HUST/vllm-hust-benchmark/tree/fbf4a916fb17e3923ed51a31a9318bcaecdfa6db/reports/tech-outcomes-20261117/kv-tiering)。
 - [分项补证要求](https://github.com/vLLM-HUST/vllm-hust-kv-tiering/issues/7#issuecomment-6846017531)。
 - [组织补证总表](https://github.com/vLLM-HUST/vllm-hust-benchmark/issues/664)。
 
-该报告是历史完整实验的补证草稿，原始大附件公共归档仍待发布，不是已完成验收。
+该报告是历史完整实验的补证草稿，公开9个完整实验臂、9885条请求的数值记录与离线复算入口。
+完整输入、轨迹和SSE由保管人受控保存，位置、哈希与获取方式见报告中的controlled-location.json；
+尚未独立验证审核者取件，不是已完成验收。无需将公开Release作为唯一归档方式。
 归档状态以报告中的RAW_PUBLICATION_STATUS.md与raw-archive-manifest.json为准。
 原始输入、流式响应及测量时插件payload已做离线一致性核对，没有新增设备测试。
 复现配置见[运行说明](reproduction.zh-CN.md)。三层机制与两层回放应分别评估。
