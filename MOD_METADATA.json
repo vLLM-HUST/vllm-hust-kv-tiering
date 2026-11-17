@@ -20,8 +20,13 @@
   "mod_id": "kv-tiering-migration",
   "repository": "vllm-hust-kv-tiering",
   "responsibility": {
-    "advisor_status": "unknown",
-    "advisors": [],
+    "advisor_status": "declared",
+    "advisors": [
+      {
+        "name": "Jin Zhao / 赵进",
+        "relationship": "internal"
+      }
+    ],
     "maintainers": [
       {
         "github": "JieYang2001",
